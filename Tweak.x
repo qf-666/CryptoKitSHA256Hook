@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import "fishhook.h"
 
@@ -296,6 +297,7 @@
 static long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
 static long long gRequestHitCount = 0;
+static long long gBusinessRawHitCount = 0;
 static BOOL gDidLogQiekjRuleSummary = NO;
 
 static NSString *const kQiekjSignTemplate = @"appSecret=%@&channel=%@&timestamp=%@&token=%@&version=%@&%@";
@@ -309,7 +311,23 @@ static NSLock *incrementalLock;
 static NSMutableDictionary *incrementalHmacBuffers;
 static NSMutableDictionary *incrementalHmacKeys;
 static NSLock *incrementalHmacLock;
+static NSLock *businessTraceLock;
+static NSString *gLastBusinessRaw = nil;
+static NSString *gLastBusinessHash = nil;
 static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
+
+typedef struct {
+    uint64_t word0;
+    uint64_t word1;
+} SwiftPair;
+
+typedef NSString *(*SwiftStringToNSStringFunc)(SwiftPair value);
+typedef SwiftPair (*SwiftStringToDataFunc)(SwiftPair value);
+
+static SwiftStringToNSStringFunc gSwiftStringToNSString = NULL;
+static SwiftStringToDataFunc orig_qe_string_to_data = NULL;
+
+static const uint64_t kQEStringToDataEA = 0x100C36D54ULL;
 
 static NSString *stringFromBytes(const void *bytes, size_t length) {
     if (!bytes || length == 0) {
@@ -410,6 +428,67 @@ static NSString *sha256HexForString(NSString *rawString) {
     return digestHexString(digest, CC_SHA256_DIGEST_LENGTH);
 }
 
+static NSString *stringFromSwiftString(SwiftPair value) {
+    if (!gSwiftStringToNSString) {
+        return nil;
+    }
+    @try {
+        return gSwiftStringToNSString(value);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static void storeLatestBusinessTrace(NSString *raw, NSString *hashString) {
+    if (!businessTraceLock) {
+        return;
+    }
+    [businessTraceLock lock];
+    gLastBusinessRaw = [raw copy];
+    gLastBusinessHash = [hashString copy];
+    [businessTraceLock unlock];
+}
+
+static NSDictionary<NSString *, NSString *> *latestBusinessTrace(void) {
+    if (!businessTraceLock) {
+        return nil;
+    }
+    [businessTraceLock lock];
+    NSDictionary<NSString *, NSString *> *snapshot = nil;
+    if (gLastBusinessRaw.length > 0 || gLastBusinessHash.length > 0) {
+        snapshot = @{
+            @"raw": gLastBusinessRaw ?: @"",
+            @"hash": gLastBusinessHash ?: @""
+        };
+    }
+    [businessTraceLock unlock];
+    return snapshot;
+}
+
+static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
+
+static void logBusinessRawTrace(NSString *rawString) {
+    if (rawString.length == 0) {
+        return;
+    }
+
+    NSString *hashString = sha256HexForString(rawString) ?: @"<hash-failed>";
+    storeLatestBusinessTrace(rawString, hashString);
+
+    long long hitCount = __sync_add_and_fetch(&gBusinessRawHitCount, 1);
+    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+    NSString *logMessage = [NSString stringWithFormat:
+                            @"[QE Raw #%lld]\n"
+                            @"Source: sub_100C36D54\n"
+                            @"Meaning: business raw string -> Data -> CryptoKit.SHA256\n"
+                            @"Raw: %@\n"
+                            @"SHA256(Local): %@",
+                            hitCount,
+                            rawString,
+                            hashString];
+    appendLogMessage(logMessage, @"QEDataBridge", @"self-raw", rawHits);
+}
+
 static NSString *normalizedQiekjPath(NSURLRequest *request) {
     NSString *absoluteURL = request.URL.absoluteString ?: @"";
     NSString *path = absoluteURL;
@@ -495,8 +574,6 @@ static NSDictionary<NSString *, NSString *> *computedQiekjSignInfo(NSURLRequest 
     return info;
 }
 
-static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
-
 static void logQiekjRuleSummaryIfNeeded(long long rawHits) {
     if (gDidLogQiekjRuleSummary) {
         return;
@@ -576,6 +653,7 @@ static void logInterestingRequest(NSURLRequest *request, NSString *source) {
     NSString *computedSign = signInfo[@"sign"];
     NSString *note = @"request";
     NSMutableString *extra = [NSMutableString string];
+    NSDictionary<NSString *, NSString *> *businessTrace = latestBusinessTrace();
     [extra appendString:@"\nRuleSource: IDA-MCP"];
     [extra appendFormat:@"\nEntryChain: %@", signInfo[@"entryChain"] ?: kQiekjSignEntryChain];
     [extra appendFormat:@"\nHashAlgorithm: %@", signInfo[@"algorithm"] ?: kQiekjSignAlgorithm];
@@ -584,6 +662,14 @@ static void logInterestingRequest(NSURLRequest *request, NSString *source) {
     [extra appendFormat:@"\nPathRule: %@", signInfo[@"pathRule"] ?: kQiekjPathRule];
     [extra appendFormat:@"\nTokenSource: %@", signInfo[@"tokenSource"] ?: @"<unknown>"];
     [extra appendFormat:@"\nVersionSource: %@", signInfo[@"versionSource"] ?: @"<unknown>"];
+    if (businessTrace[@"raw"]) {
+        [extra appendFormat:@"\nBusinessRawSeen: %@", businessTrace[@"raw"]];
+    }
+    if (businessTrace[@"hash"]) {
+        BOOL businessMatch = [businessTrace[@"hash"] caseInsensitiveCompare:actualSign] == NSOrderedSame;
+        [extra appendFormat:@"\nBusinessRawSHA256: %@", businessTrace[@"hash"]];
+        [extra appendFormat:@"\nBusinessRawMatch: %@", businessMatch ? @"YES" : @"NO"];
+    }
     if (computedSign.length > 0) {
         BOOL matched = [computedSign caseInsensitiveCompare:actualSign] == NSOrderedSame;
         note = matched ? @"sign-ok" : @"sign-miss";
@@ -787,6 +873,20 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
     orig_cryptokit_sha256(a, b, c);
 }
 
+static SwiftPair my_qe_string_to_data(SwiftPair rawValue) {
+    NSString *rawString = stringFromSwiftString(rawValue);
+    SwiftPair ret = orig_qe_string_to_data(rawValue);
+
+    BOOL interesting = (rawString.length > 0 &&
+                        ([rawString containsString:@"appSecret="] ||
+                         [rawString containsString:@"channel="] ||
+                         [rawString containsString:@"timestamp="]));
+    if (interesting) {
+        logBusinessRawTrace(rawString);
+    }
+    return ret;
+}
+
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
@@ -816,6 +916,7 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
 %ctor {
     incrementalBuffers = [NSMutableDictionary dictionary];
     incrementalLock = [[NSLock alloc] init];
+    businessTraceLock = [[NSLock alloc] init];
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification
@@ -877,4 +978,30 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
             MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
         }
     }
+
+    MSImageRef swiftFoundationRef = MSGetImageByName("/usr/lib/swift/libswiftFoundation.dylib");
+    if (swiftFoundationRef) {
+        gSwiftStringToNSString = (SwiftStringToNSStringFunc)MSFindSymbol(swiftFoundationRef, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
+    }
+
+    if (gSwiftStringToNSString) {
+        intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+        uintptr_t qeStringToDataAddr = (uintptr_t)((intptr_t)kQEStringToDataEA + slide);
+        MSHookFunction((void *)qeStringToDataAddr, (void *)my_qe_string_to_data, (void **)&orig_qe_string_to_data);
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+        if (gSwiftStringToNSString && orig_qe_string_to_data) {
+            appendLogMessage(@"[QE Runtime Hook]\nSource: sub_100C36D54\nStatus: installed\nMeaning: capture real raw string before CryptoKit.SHA256",
+                             @"QEDataBridge",
+                             @"installed",
+                             rawHits);
+        } else if (!gSwiftStringToNSString) {
+            appendLogMessage(@"[QE Runtime Hook]\nSource: libswiftFoundation\nStatus: missing String->NSString bridge symbol",
+                             @"QEDataBridge",
+                             @"bridge-missing",
+                             rawHits);
+        }
+    });
 }
