@@ -27,7 +27,6 @@
         if (!win) win = [[self alloc] initWithFrame:[UIScreen mainScreen].bounds];
         
         win.windowLevel = UIWindowLevelAlert + 1000;
-        win.userInteractionEnabled = NO; // 不阻挡底层点击
         win.backgroundColor = [UIColor clearColor];
 
         // 必须设置 rootViewController，否则 iOS 会引发异常导致崩溃
@@ -37,24 +36,50 @@
         
         win.hidden = NO;
 
-        // 顶部悬浮框
+        // 顶部悬浮框 (允许交互，长按复制，可滚动)
         UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 80, [UIScreen mainScreen].bounds.size.width - 20, 250)];
         tv.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
         tv.textColor = [UIColor systemGreenColor];
         tv.font = [UIFont systemFontOfSize:10];
         tv.editable = NO;
+        tv.selectable = YES; // 允许长按复制
+        tv.userInteractionEnabled = YES; // 允许滑动
         tv.layer.cornerRadius = 8;
         tv.clipsToBounds = YES;
         [win addSubview:tv];
         win.textView = tv;
+        
+        // 增加一个清空按钮
+        UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        clearBtn.frame = CGRectMake([UIScreen mainScreen].bounds.size.width - 60, 45, 50, 30);
+        [clearBtn setTitle:@"清空" forState:UIControlStateNormal];
+        [clearBtn setBackgroundColor:[UIColor darkGrayColor]];
+        [clearBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        clearBtn.layer.cornerRadius = 5;
+        clearBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+        [clearBtn addTarget:win action:@selector(clearLogs) forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:clearBtn];
     });
     return win;
+}
+- (void)clearLogs {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.textView.text = @"";
+    });
 }
 - (void)addLog:(NSString *)log {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.textView) return;
         self.textView.text = [NSString stringWithFormat:@"%@\n\n%@", log, self.textView.text];
     });
+}
+// 允许事件穿透背景（可以正常点下面的 App），但不穿透我们的文本框和按钮
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    if (hitView == self || hitView == self.rootViewController.view) {
+        return nil;
+    }
+    return hitView;
 }
 @end
 
@@ -68,6 +93,13 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     NSString *inStr = [[NSString alloc] initWithData:inData encoding:NSUTF8StringEncoding];
     if (!inStr) {
         inStr = [NSString stringWithFormat:@"<Binary Data: %zu bytes>", len];
+    }
+    
+    // !!! 【核心防护墙：关键字过滤】 !!!
+    // 日常系统请求（比如 SafariSafeBrowsing）会疯狂调用 SHA256 导致日志刷屏看不见，
+    // 这里只放行你关心的明文请求。如果不是 appSecret，直接 return 丢弃！
+    if (![inStr containsString:@"appSecret="] && ![inStr containsString:@"qiekj.com"]) {
+        return; 
     }
     
     // 获取 SHA256 计算后的十六进制结果
@@ -100,9 +132,24 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     // 1. Console 日志输出
     NSLog(@"[SHA256_HOOK] \n%@", logMsg);
     
-    // 2. 悬浮窗输出
+    // 2. 写入 TXT 文件 (沙盒 Documents目录)
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logFilePath = [docPath stringByAppendingPathComponent:@"CryptoHook.txt"];
+    
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
+    NSString *fileLogStr = [logMsg stringByAppendingString:@"\n\n----------------------------\n"];
+    if (!fileHandle) {
+        [fileLogStr writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[fileLogStr dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    }
+    
+    // 3. 悬浮窗输出（附带路径提示）
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[SHAFloatingWindow shared] addLog:logMsg];
+        NSString *displayMsg = [logMsg stringByAppendingFormat:@"\n\n[文件已保存至]\n%@", logFilePath];
+        [[SHAFloatingWindow shared] addLog:displayMsg];
     });
 }
 
