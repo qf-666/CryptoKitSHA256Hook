@@ -28,8 +28,14 @@
         
         win.windowLevel = UIWindowLevelAlert + 1000;
         win.userInteractionEnabled = NO; // 不阻挡底层点击
-        win.hidden = NO;
         win.backgroundColor = [UIColor clearColor];
+
+        // 必须设置 rootViewController，否则 iOS 会引发异常导致崩溃
+        UIViewController *rootVC = [[UIViewController alloc] init];
+        rootVC.view.backgroundColor = [UIColor clearColor];
+        win.rootViewController = rootVC;
+        
+        win.hidden = NO;
 
         // 顶部悬浮框
         UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 80, [UIScreen mainScreen].bounds.size.width - 20, 250)];
