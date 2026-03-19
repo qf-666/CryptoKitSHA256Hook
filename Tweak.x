@@ -9,6 +9,7 @@
 @property (nonatomic, strong) UIView *headerView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UIButton *copyButton;
 @property (nonatomic, strong) UIButton *clearButton;
 @property (nonatomic, strong) UIButton *collapseButton;
 @property (nonatomic, strong) UITextView *textView;
@@ -129,6 +130,15 @@
     [self.clearButton addTarget:self action:@selector(clearLogs) forControlEvents:UIControlEventTouchUpInside];
     [self.headerView addSubview:self.clearButton];
 
+    self.copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.copyButton setTitle:@"Copy" forState:UIControlStateNormal];
+    [self.copyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.copyButton.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
+    self.copyButton.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.85];
+    self.copyButton.layer.cornerRadius = 9.0;
+    [self.copyButton addTarget:self action:@selector(copyLogs) forControlEvents:UIControlEventTouchUpInside];
+    [self.headerView addSubview:self.copyButton];
+
     self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.textView.backgroundColor = [UIColor clearColor];
     self.textView.textColor = [UIColor systemGreenColor];
@@ -178,10 +188,11 @@
 
     CGFloat width = CGRectGetWidth(self.panelView.bounds);
     self.headerView.frame = CGRectMake(0.0, 0.0, width, 66.0);
-    self.titleLabel.frame = CGRectMake(12.0, 10.0, width - 112.0, 18.0);
-    self.statusLabel.frame = CGRectMake(12.0, 29.0, width - 112.0, 28.0);
-    self.collapseButton.frame = CGRectMake(width - 96.0, 14.0, 36.0, 36.0);
-    self.clearButton.frame = CGRectMake(width - 54.0, 14.0, 42.0, 36.0);
+    self.titleLabel.frame = CGRectMake(12.0, 10.0, width - 164.0, 18.0);
+    self.statusLabel.frame = CGRectMake(12.0, 29.0, width - 164.0, 28.0);
+    self.collapseButton.frame = CGRectMake(width - 138.0, 14.0, 36.0, 36.0);
+    self.copyButton.frame = CGRectMake(width - 96.0, 14.0, 42.0, 36.0);
+    self.clearButton.frame = CGRectMake(width - 48.0, 14.0, 42.0, 36.0);
 
     self.textView.hidden = self.collapsed;
     if (!self.collapsed) {
@@ -239,6 +250,17 @@
 
 - (void)clearLogs {
     self.textView.text = @"";
+}
+
+- (void)copyLogs {
+    NSString *fullText = self.textView.text ?: @"";
+    [UIPasteboard generalPasteboard].string = fullText;
+
+    NSString *oldTitle = [self.copyButton titleForState:UIControlStateNormal];
+    [self.copyButton setTitle:@"Done" forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.copyButton setTitle:(oldTitle ?: @"Copy") forState:UIControlStateNormal];
+    });
 }
 
 - (void)addLog:(NSString *)log {
@@ -506,15 +528,7 @@ static void logInterestingRequest(NSURLRequest *request, NSString *source) {
                             extra];
 
     NSLog(@"[SHA256_HOOK_REQUEST]\n%@", logMessage);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        SHAFloatingWindow *window = [SHAFloatingWindow shared];
-        [window updateStatusWithRawHits:rawHits
-                              shownHits:shownHits
-                            requestHits:requestHits
-                             lastSource:source
-                                   note:note];
-        [window addLog:logMessage];
-    });
+    appendLogMessage(logMessage, source, note, rawHits);
 }
 
 static void process_sha256(const void *data, size_t len, unsigned char *digest, NSString *source) {
