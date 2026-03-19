@@ -179,9 +179,48 @@ static void my_ccdigest(const struct ccdigest_info *di, size_t len, const void *
     }
 }
 
-// 增量: ccdigest_init 等底层函数由于函数体在 ARM64 下过短（只有两三条指令），
-// 强行 MSHookFunction 会导致 trampoline 覆盖并损坏相邻的 ccrng_generate 函数，
-// 从而引发 SIGBUS / Permission fault 闪退！因此这里只能移除他们的内联 Hook。
+// 增量: ccdigest_init
+static void (*orig_ccdigest_init)(const struct ccdigest_info *di, void *ctx);
+static void my_ccdigest_init(const struct ccdigest_info *di, void *ctx) {
+    orig_ccdigest_init(di, ctx);
+    if (di && di->output_size == 32) {
+        [incrementalLock lock];
+        incrementalBuffers[[NSValue valueWithPointer:ctx]] = [NSMutableData data];
+        [incrementalLock unlock];
+    }
+}
+
+// 增量: ccdigest_update
+static void (*orig_ccdigest_update)(const struct ccdigest_info *di, void *ctx, size_t len, const void *data);
+static void my_ccdigest_update(const struct ccdigest_info *di, void *ctx, size_t len, const void *data) {
+    orig_ccdigest_update(di, ctx, len, data);
+    if (di && di->output_size == 32 && len > 0 && data) {
+        [incrementalLock lock];
+        NSMutableData *buf = incrementalBuffers[[NSValue valueWithPointer:ctx]];
+        if (buf) [buf appendBytes:data length:len];
+        [incrementalLock unlock];
+    }
+}
+
+// 增量: ccdigest_final
+static void (*orig_ccdigest_final)(const struct ccdigest_info *di, void *ctx, unsigned char *digest);
+static void my_ccdigest_final(const struct ccdigest_info *di, void *ctx, unsigned char *digest) {
+    orig_ccdigest_final(di, ctx, digest);
+    if (di && di->output_size == 32) {
+        [incrementalLock lock];
+        NSValue *key = [NSValue valueWithPointer:ctx];
+        NSMutableData *buf = incrementalBuffers[key];
+        NSData *finalData = nil;
+        if (buf) {
+            finalData = [buf copy];
+            [incrementalBuffers removeObjectForKey:key];
+        }
+        [incrementalLock unlock];
+        if (finalData) {
+            process_sha256(finalData.bytes, finalData.length, digest, @"ccdigest_incremental");
+        }
+    }
+}
 
 
 // --- Hook 2: CommonCrypto (包含一次性和增量) ---
