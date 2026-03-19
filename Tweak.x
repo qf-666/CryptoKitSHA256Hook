@@ -9,7 +9,7 @@
 @property (nonatomic, strong) UIView *headerView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UIButton *copyLogsButton;
+@property (nonatomic, strong) UIButton *clipboardButton;
 @property (nonatomic, strong) UIButton *clearButton;
 @property (nonatomic, strong) UIButton *collapseButton;
 @property (nonatomic, strong) UITextView *textView;
@@ -130,14 +130,14 @@
     [self.clearButton addTarget:self action:@selector(clearLogs) forControlEvents:UIControlEventTouchUpInside];
     [self.headerView addSubview:self.clearButton];
 
-    self.copyLogsButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.copyLogsButton setTitle:@"Copy" forState:UIControlStateNormal];
-    [self.copyLogsButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.copyLogsButton.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
-    self.copyLogsButton.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.85];
-    self.copyLogsButton.layer.cornerRadius = 9.0;
-    [self.copyLogsButton addTarget:self action:@selector(copyLogs) forControlEvents:UIControlEventTouchUpInside];
-    [self.headerView addSubview:self.copyLogsButton];
+    self.clipboardButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.clipboardButton setTitle:@"Copy" forState:UIControlStateNormal];
+    [self.clipboardButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.clipboardButton.titleLabel.font = [UIFont boldSystemFontOfSize:11.0];
+    self.clipboardButton.backgroundColor = [[UIColor darkGrayColor] colorWithAlphaComponent:0.85];
+    self.clipboardButton.layer.cornerRadius = 9.0;
+    [self.clipboardButton addTarget:self action:@selector(copyLogs) forControlEvents:UIControlEventTouchUpInside];
+    [self.headerView addSubview:self.clipboardButton];
 
     self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.textView.backgroundColor = [UIColor clearColor];
@@ -191,7 +191,7 @@
     self.titleLabel.frame = CGRectMake(12.0, 10.0, width - 164.0, 18.0);
     self.statusLabel.frame = CGRectMake(12.0, 29.0, width - 164.0, 28.0);
     self.collapseButton.frame = CGRectMake(width - 138.0, 14.0, 36.0, 36.0);
-    self.copyLogsButton.frame = CGRectMake(width - 96.0, 14.0, 42.0, 36.0);
+    self.clipboardButton.frame = CGRectMake(width - 96.0, 14.0, 42.0, 36.0);
     self.clearButton.frame = CGRectMake(width - 48.0, 14.0, 42.0, 36.0);
 
     self.textView.hidden = self.collapsed;
@@ -256,10 +256,10 @@
     NSString *fullText = self.textView.text ?: @"";
     [UIPasteboard generalPasteboard].string = fullText;
 
-    NSString *oldTitle = [self.copyLogsButton titleForState:UIControlStateNormal];
-    [self.copyLogsButton setTitle:@"Done" forState:UIControlStateNormal];
+    NSString *oldTitle = [self.clipboardButton titleForState:UIControlStateNormal];
+    [self.clipboardButton setTitle:@"Done" forState:UIControlStateNormal];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.copyLogsButton setTitle:(oldTitle ?: @"Copy") forState:UIControlStateNormal];
+        [self.clipboardButton setTitle:(oldTitle ?: @"Copy") forState:UIControlStateNormal];
     });
 }
 
