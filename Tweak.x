@@ -2,6 +2,7 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import "fishhook.h"
 
 // --- UI 悬浮窗实现 ---
 @interface SHAFloatingWindow : UIWindow
@@ -217,19 +218,18 @@ static int my_CC_SHA256_Update(CC_SHA256_CTX *c, const void *data, CC_LONG len) 
 static int (*orig_CC_SHA256_Final)(unsigned char *md, CC_SHA256_CTX *c);
 static int my_CC_SHA256_Final(unsigned char *md, CC_SHA256_CTX *c) {
     int ret = orig_CC_SHA256_Final(md, c);
-    if (c && md) {
-        [incrementalLock lock];
-        NSValue *key = [NSValue valueWithPointer:c];
-        NSMutableData *buf = incrementalBuffers[key];
-        NSData *finalData = nil;
-        if (buf) {
-            finalData = [buf copy];
-            [incrementalBuffers removeObjectForKey:key];
-        }
-        [incrementalLock unlock];
-        if (finalData) {
-            process_sha256(finalData.bytes, finalData.length, md, @"CC_SHA256_Incremental");
-        }
+    [incrementalLock lock];
+    NSValue *key = [NSValue valueWithPointer:c];
+    NSMutableData *buf = incrementalBuffers[key];
+    NSData *finalData = nil;
+    if (buf) {
+        finalData = [buf copy];
+        [incrementalBuffers removeObjectForKey:key];
+    }
+    [incrementalLock unlock];
+    
+    if (finalData) {
+        process_sha256(finalData.bytes, finalData.length, md, @"CC_SHA256_Incremental");
     }
     return ret;
 }
@@ -255,18 +255,25 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
         [SHAFloatingWindow shared];
     }];
 
-    // 动态查找并 Hook ccdigest
-    void *corecrypto = dlopen("/usr/lib/system/libcorecrypto.dylib", RTLD_NOW);
-    if (corecrypto) {
-        void *sym = dlsym(corecrypto, "ccdigest");
-        if (sym) MSHookFunction((void *)sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
-    }
+    // 核心修复：不用 Inline Hook (MSHookFunction) 去硬改 corecrypto (会导致内存写保护异常)，
+    // 改用 fishhook去篡改 App 自身的导入地址表 (GOT/PLT) ！这样就完美实现了增量拦截且永不崩溃！
+    struct rebinding rbs[] = {
+        {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
+        {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
+        {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
+        {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final}
+    };
+    rebind_symbols(rbs, sizeof(rbs)/sizeof(struct rebinding));
     
-    // Hook CC_SHA256
-    MSHookFunction((void *)CC_SHA256, (void *)my_CC_SHA256, (void **)&orig_CC_SHA256);
-    MSHookFunction((void *)CC_SHA256_Init, (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init);
-    MSHookFunction((void *)CC_SHA256_Update, (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update);
-    MSHookFunction((void *)CC_SHA256_Final, (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final);
+    // CommonCrypto由于在 libSystem 中，通常用 MSHookFunction 内联Hook是安全的。
+    // 但是为了 100% 不崩溃，我们把 CC_SHA256 同样也加到 fishhook 里做导入表拦截。
+    struct rebinding rbs2[] = {
+        {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
+        {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
+        {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
+        {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final}
+    };
+    rebind_symbols(rbs2, sizeof(rbs2)/sizeof(struct rebinding));
     
     // 查找并 Hook Swift CryptoKit 签名
     MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");

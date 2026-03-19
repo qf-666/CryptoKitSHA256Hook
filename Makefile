@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = CryptoKitSHA256Hook
 
-CryptoKitSHA256Hook_FILES = Tweak.x
+CryptoKitSHA256Hook_FILES = Tweak.x fishhook.c
 CryptoKitSHA256Hook_CFLAGS = -fobjc-arc
 CryptoKitSHA256Hook_FRAMEWORKS = UIKit Foundation
 
