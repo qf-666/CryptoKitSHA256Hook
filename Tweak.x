@@ -154,7 +154,11 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
 }
 
 
-// --- Hook 1: ccdigest (corecrypto 底层兜底) ---
+// --- 增量哈希 (Incremental Hashing) 追踪 ---
+static NSMutableDictionary *incrementalBuffers;
+static NSLock *incrementalLock;
+
+// --- Hook 1: corecrypto (包含一次性和增量) ---
 struct ccdigest_info {
     size_t output_size;
     size_t state_size;
@@ -169,34 +173,119 @@ struct ccdigest_info {
 static void (*orig_ccdigest)(const struct ccdigest_info *di, size_t len, const void *data, void *digest);
 static void my_ccdigest(const struct ccdigest_info *di, size_t len, const void *data, void *digest) {
     orig_ccdigest(di, len, data, digest);
-    if (di && di->output_size == 32) { // 32 bytes = 256 bits
+    if (di && di->output_size == 32) {
         process_sha256(data, len, (unsigned char *)digest, @"ccdigest");
     }
 }
 
+// 增量: ccdigest_init
+static void (*orig_ccdigest_init)(const struct ccdigest_info *di, void *ctx);
+static void my_ccdigest_init(const struct ccdigest_info *di, void *ctx) {
+    orig_ccdigest_init(di, ctx);
+    if (di && di->output_size == 32) {
+        [incrementalLock lock];
+        incrementalBuffers[[NSValue valueWithPointer:ctx]] = [NSMutableData data];
+        [incrementalLock unlock];
+    }
+}
 
-// --- Hook 2: CC_SHA256 (CommonCrypto 补充兜底) ---
+// 增量: ccdigest_update
+static void (*orig_ccdigest_update)(const struct ccdigest_info *di, void *ctx, size_t len, const void *data);
+static void my_ccdigest_update(const struct ccdigest_info *di, void *ctx, size_t len, const void *data) {
+    orig_ccdigest_update(di, ctx, len, data);
+    if (di && di->output_size == 32 && len > 0 && data) {
+        [incrementalLock lock];
+        NSMutableData *buf = incrementalBuffers[[NSValue valueWithPointer:ctx]];
+        if (buf) [buf appendBytes:data length:len];
+        [incrementalLock unlock];
+    }
+}
+
+// 增量: ccdigest_final
+static void (*orig_ccdigest_final)(const struct ccdigest_info *di, void *ctx, unsigned char *digest);
+static void my_ccdigest_final(const struct ccdigest_info *di, void *ctx, unsigned char *digest) {
+    orig_ccdigest_final(di, ctx, digest);
+    if (di && di->output_size == 32) {
+        [incrementalLock lock];
+        NSValue *key = [NSValue valueWithPointer:ctx];
+        NSMutableData *buf = incrementalBuffers[key];
+        NSData *finalData = nil;
+        if (buf) {
+            finalData = [buf copy];
+            [incrementalBuffers removeObjectForKey:key];
+        }
+        [incrementalLock unlock];
+        if (finalData) {
+            process_sha256(finalData.bytes, finalData.length, digest, @"ccdigest_incremental");
+        }
+    }
+}
+
+
+// --- Hook 2: CommonCrypto (包含一次性和增量) ---
 static unsigned char * (*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
 static unsigned char * my_CC_SHA256(const void *data, CC_LONG len, unsigned char *md) {
     unsigned char *ret = orig_CC_SHA256(data, len, md);
-    if (ret) {
-        process_sha256(data, len, ret, @"CC_SHA256");
+    if (ret) process_sha256(data, len, ret, @"CC_SHA256");
+    return ret;
+}
+
+static int (*orig_CC_SHA256_Init)(CC_SHA256_CTX *c);
+static int my_CC_SHA256_Init(CC_SHA256_CTX *c) {
+    int ret = orig_CC_SHA256_Init(c);
+    if (c) {
+        [incrementalLock lock];
+        incrementalBuffers[[NSValue valueWithPointer:c]] = [NSMutableData data];
+        [incrementalLock unlock];
     }
     return ret;
 }
 
+static int (*orig_CC_SHA256_Update)(CC_SHA256_CTX *c, const void *data, CC_LONG len);
+static int my_CC_SHA256_Update(CC_SHA256_CTX *c, const void *data, CC_LONG len) {
+    int ret = orig_CC_SHA256_Update(c, data, len);
+    if (c && len > 0 && data) {
+        [incrementalLock lock];
+        NSMutableData *buf = incrementalBuffers[[NSValue valueWithPointer:c]];
+        if (buf) [buf appendBytes:data length:len];
+        [incrementalLock unlock];
+    }
+    return ret;
+}
+
+static int (*orig_CC_SHA256_Final)(unsigned char *md, CC_SHA256_CTX *c);
+static int my_CC_SHA256_Final(unsigned char *md, CC_SHA256_CTX *c) {
+    int ret = orig_CC_SHA256_Final(md, c);
+    if (c && md) {
+        [incrementalLock lock];
+        NSValue *key = [NSValue valueWithPointer:c];
+        NSMutableData *buf = incrementalBuffers[key];
+        NSData *finalData = nil;
+        if (buf) {
+            finalData = [buf copy];
+            [incrementalBuffers removeObjectForKey:key];
+        }
+        [incrementalLock unlock];
+        if (finalData) {
+            process_sha256(finalData.bytes, finalData.length, md, @"CC_SHA256_Incremental");
+        }
+    }
+    return ret;
+}
 
 // --- Hook 3: CryptoKit.SHA256.hash(data:) (Swift 符号补充) ---
-// 注意：Swift 泛型签名会附带 witness table, 为了不破坏寄存器，这里只监听拦截但不读取其 payload
-// (由于 CryptoKit 在 iOS 上固定依赖 ccdigest，明文和 cipher 都会落在 Hook 1 中安全解析)
+// 由于我们已经捕获了底层增量实现，这里不做深入捕获以防 Register 被破坏
 static void (*orig_cryptokit_sha256)(void *a, void *b, void *c);
 static void my_cryptokit_sha256(void *a, void *b, void *c) {
-    NSLog(@"[SHA256_HOOK] -> Hit Swift CryptoKit.SHA256 wrapper (Payload intercepted by ccdigest)");
+    NSLog(@"[SHA256_HOOK] -> Hit Swift CryptoKit.SHA256 wrapper (Payload intercepted by incremental corecrypto)");
     orig_cryptokit_sha256(a, b, c);
 }
 
 
 %ctor {
+    incrementalBuffers = [NSMutableDictionary dictionary];
+    incrementalLock = [[NSLock alloc] init];
+
     // 延迟直到 App 界面加载完成后再生成悬浮窗
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification 
                                                       object:nil 
@@ -209,13 +298,23 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
     void *corecrypto = dlopen("/usr/lib/system/libcorecrypto.dylib", RTLD_NOW);
     if (corecrypto) {
         void *sym = dlsym(corecrypto, "ccdigest");
-        if (sym) {
-            MSHookFunction((void *)sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
-        }
+        if (sym) MSHookFunction((void *)sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
+        
+        void *sym_init = dlsym(corecrypto, "ccdigest_init");
+        if (sym_init) MSHookFunction((void *)sym_init, (void *)my_ccdigest_init, (void **)&orig_ccdigest_init);
+        
+        void *sym_update = dlsym(corecrypto, "ccdigest_update");
+        if (sym_update) MSHookFunction((void *)sym_update, (void *)my_ccdigest_update, (void **)&orig_ccdigest_update);
+        
+        void *sym_final = dlsym(corecrypto, "ccdigest_final");
+        if (sym_final) MSHookFunction((void *)sym_final, (void *)my_ccdigest_final, (void **)&orig_ccdigest_final);
     }
     
     // Hook CC_SHA256
     MSHookFunction((void *)CC_SHA256, (void *)my_CC_SHA256, (void **)&orig_CC_SHA256);
+    MSHookFunction((void *)CC_SHA256_Init, (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init);
+    MSHookFunction((void *)CC_SHA256_Update, (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update);
+    MSHookFunction((void *)CC_SHA256_Final, (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final);
     
     // 查找并 Hook Swift CryptoKit 签名
     MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
