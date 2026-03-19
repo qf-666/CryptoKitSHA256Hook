@@ -1,0 +1,38 @@
+name: Build Tweak for TrollFools
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y fakeroot ldid clang make perl libz-dev curl
+
+      - name: Set up Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      - name: Set up iOS SDK
+        run: git clone https://github.com/theos/sdks.git theos/sdks
+
+      - name: Build deb Package
+        run: |
+          export THEOS=$PWD/theos
+          make package FINALPACKAGE=1
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CryptoKitSHA256Hook-Dylib
+          path: packages/*.deb

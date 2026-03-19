@@ -1,0 +1,7 @@
+.theos/
+obj/
+packages/
+*.deb
+*.dylib
+.DS_Store
+Thumbs.db
