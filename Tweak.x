@@ -260,15 +260,6 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
     if (corecrypto) {
         void *sym = dlsym(corecrypto, "ccdigest");
         if (sym) MSHookFunction((void *)sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
-        
-        void *sym_init = dlsym(corecrypto, "ccdigest_init");
-        if (sym_init) MSHookFunction((void *)sym_init, (void *)my_ccdigest_init, (void **)&orig_ccdigest_init);
-        
-        void *sym_update = dlsym(corecrypto, "ccdigest_update");
-        if (sym_update) MSHookFunction((void *)sym_update, (void *)my_ccdigest_update, (void **)&orig_ccdigest_update);
-        
-        void *sym_final = dlsym(corecrypto, "ccdigest_final");
-        if (sym_final) MSHookFunction((void *)sym_final, (void *)my_ccdigest_final, (void **)&orig_ccdigest_final);
     }
     
     // Hook CC_SHA256
