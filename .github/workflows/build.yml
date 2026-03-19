@@ -8,6 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  THEOS: ${{ github.workspace }}/theos
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,26 +18,23 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
-        run: sudo apt-get update && sudo apt-get install -y fakeroot ldid clang make perl libz-dev curl
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6
 
-      - name: Set up Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          path: theos
-          submodules: recursive
-
-      - name: Set up iOS SDK
-        run: git clone https://github.com/theos/sdks.git theos/sdks
+      - name: Set up Theos Toolchain and SDK
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ -C "$THEOS/toolchain"
+          "$THEOS/bin/install-sdk" latest
 
       - name: Build deb Package
-        run: |
-          export THEOS=$PWD/theos
-          make package FINALPACKAGE=1
+        run: make package FINALPACKAGE=1
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CryptoKitSHA256Hook-Dylib
+          name: CryptoKitSHA256Hook-deb
           path: packages/*.deb
