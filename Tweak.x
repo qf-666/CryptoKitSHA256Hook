@@ -19,6 +19,7 @@
 - (void)addLog:(NSString *)log;
 - (void)updateStatusWithRawHits:(long long)rawHits
                       shownHits:(long long)shownHits
+                    requestHits:(long long)requestHits
                      lastSource:(NSString *)lastSource
                            note:(NSString *)note;
 @end
@@ -140,7 +141,7 @@
     [self.panelView addSubview:self.textView];
 
     [self.rootViewController.view addSubview:self.panelView];
-    [self updateStatusWithRawHits:0 shownHits:0 lastSource:@"Loaded" note:@"ready"];
+    [self updateStatusWithRawHits:0 shownHits:0 requestHits:0 lastSource:@"Loaded" note:@"ready"];
 
     self.hidden = NO;
     [self setNeedsLayout];
@@ -249,9 +250,15 @@
 
 - (void)updateStatusWithRawHits:(long long)rawHits
                       shownHits:(long long)shownHits
+                    requestHits:(long long)requestHits
                      lastSource:(NSString *)lastSource
                            note:(NSString *)note {
-    self.statusLabel.text = [NSString stringWithFormat:@"Raw %lld | Show %lld\n%@ | %@", rawHits, shownHits, lastSource ?: @"-", note ?: @"-"];
+    self.statusLabel.text = [NSString stringWithFormat:@"Raw %lld | Show %lld | Req %lld\n%@ | %@",
+                             rawHits,
+                             shownHits,
+                             requestHits,
+                             lastSource ?: @"-",
+                             note ?: @"-"];
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
@@ -266,9 +273,249 @@
 
 static long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
+static long long gRequestHitCount = 0;
 
 static NSMutableDictionary *incrementalBuffers;
 static NSLock *incrementalLock;
+static NSMutableDictionary *incrementalHmacBuffers;
+static NSMutableDictionary *incrementalHmacKeys;
+static NSLock *incrementalHmacLock;
+static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
+
+static NSString *stringFromBytes(const void *bytes, size_t length) {
+    if (!bytes || length == 0) {
+        return @"<empty>";
+    }
+
+    NSData *data = [NSData dataWithBytes:bytes length:length];
+    NSString *utf8 = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (utf8.length > 0) {
+        return utf8;
+    }
+
+    NSUInteger previewLength = MIN((NSUInteger)length, (NSUInteger)48);
+    const unsigned char *raw = (const unsigned char *)bytes;
+    NSMutableString *hex = [NSMutableString stringWithCapacity:(previewLength * 2) + 16];
+    for (NSUInteger i = 0; i < previewLength; i++) {
+        [hex appendFormat:@"%02x", raw[i]];
+    }
+    if (length > previewLength) {
+        [hex appendString:@"..."];
+    }
+    return [NSString stringWithFormat:@"<hex:%@>", hex];
+}
+
+static NSString *digestHexString(const unsigned char *digest, size_t length) {
+    if (!digest || length == 0) {
+        return @"<no-digest>";
+    }
+
+    NSMutableString *hashString = [NSMutableString stringWithCapacity:length * 2];
+    for (size_t i = 0; i < length; i++) {
+        [hashString appendFormat:@"%02x", digest[i]];
+    }
+    return hashString;
+}
+
+static NSString *headerValue(NSURLRequest *request, NSString *targetKey) {
+    NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
+    for (NSString *key in headers) {
+        if ([key caseInsensitiveCompare:targetKey] == NSOrderedSame) {
+            id value = headers[key];
+            return [value isKindOfClass:[NSString class]] ? (NSString *)value : [value description];
+        }
+    }
+    return nil;
+}
+
+static NSString *currentUserToken(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSArray<NSString *> *candidateKeys = @[@"KUserToken", @"userToken", @"token", @"kUserToken"];
+    for (NSString *key in candidateKeys) {
+        id value = [defaults objectForKey:key];
+        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+            return (NSString *)value;
+        }
+    }
+
+    NSDictionary *allValues = [defaults dictionaryRepresentation];
+    for (NSString *key in allValues) {
+        if ([[key lowercaseString] containsString:@"token"]) {
+            id value = allValues[key];
+            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+                return (NSString *)value;
+            }
+        }
+    }
+    return nil;
+}
+
+static NSString *sha256HexForString(NSString *rawString) {
+    if (!rawString) {
+        return nil;
+    }
+    NSData *data = [rawString dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {0};
+    if (orig_CC_SHA256) {
+        orig_CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    } else {
+        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    }
+    return digestHexString(digest, CC_SHA256_DIGEST_LENGTH);
+}
+
+static NSString *normalizedQiekjPath(NSURLRequest *request) {
+    NSString *path = request.URL.path ?: @"";
+    if (path.length == 0) {
+        return nil;
+    }
+    if (![path hasPrefix:@"/"]) {
+        path = [@"/" stringByAppendingString:path];
+    }
+    return path;
+}
+
+static NSDictionary<NSString *, NSString *> *computedQiekjSignInfo(NSURLRequest *request) {
+    NSString *host = request.URL.host.lowercaseString ?: @"";
+    if (![host containsString:@"qiekj.com"]) {
+        return nil;
+    }
+
+    NSString *timestamp = headerValue(request, @"timestamp");
+    NSString *channel = headerValue(request, @"channel") ?: @"ios_app";
+    NSString *version = headerValue(request, @"version");
+    if (version.length == 0) {
+        version = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
+    }
+    NSString *token = currentUserToken();
+    NSString *path = normalizedQiekjPath(request);
+
+    if (timestamp.length == 0 || channel.length == 0 || version.length == 0 || token.length == 0 || path.length == 0) {
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        if (timestamp.length > 0) info[@"timestamp"] = timestamp;
+        if (channel.length > 0) info[@"channel"] = channel;
+        if (version.length > 0) info[@"version"] = version;
+        if (token.length > 0) info[@"token"] = token;
+        if (path.length > 0) info[@"path"] = path;
+        return info;
+    }
+
+    NSString *secret = @"boPSJlBfm3Ff7Fha1UcLskRNsEOZzyNwQ68c9T/k2UQ=";
+    NSString *raw = [NSString stringWithFormat:@"appSecret=%@&channel=%@&timestamp=%@&token=%@&version=%@&%@",
+                     secret,
+                     channel,
+                     timestamp,
+                     token,
+                     version,
+                     path];
+    NSString *sign = sha256HexForString(raw);
+    if (!sign) {
+        return nil;
+    }
+
+    return @{
+        @"timestamp": timestamp,
+        @"channel": channel,
+        @"version": version,
+        @"token": token,
+        @"path": path,
+        @"raw": raw,
+        @"sign": sign
+    };
+}
+
+static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits) {
+    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logFilePath = [documentsPath stringByAppendingPathComponent:@"CryptoHook.txt"];
+    NSString *fileLogString = [logMessage stringByAppendingString:@"\n\n----------------------------\n"];
+
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
+    if (!fileHandle) {
+        [fileLogString writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[fileLogString dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    }
+
+    long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
+    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SHAFloatingWindow *window = [SHAFloatingWindow shared];
+        [window updateStatusWithRawHits:rawHits
+                              shownHits:shownHits
+                            requestHits:requestHits
+                             lastSource:source
+                                   note:note];
+        [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath]];
+    });
+}
+
+static void logInterestingRequest(NSURLRequest *request, NSString *source) {
+    if (!request) {
+        return;
+    }
+
+    NSString *host = request.URL.host.lowercaseString ?: @"";
+    NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
+    NSString *signValue = headers[@"sign"] ?: headers[@"Sign"] ?: headers[@"SIGN"];
+    BOOL interesting = (signValue.length > 0 || [host containsString:@"qiekj.com"]);
+    if (!interesting) {
+        return;
+    }
+
+    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 1);
+    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+    long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 0);
+
+    NSData *bodyData = request.HTTPBody;
+    NSString *bodyPreview = bodyData ? stringFromBytes(bodyData.bytes, bodyData.length) : @"<none>";
+    if (!bodyData && request.HTTPBodyStream) {
+        bodyPreview = @"<HTTPBodyStream>";
+    }
+
+    NSDictionary<NSString *, NSString *> *signInfo = computedQiekjSignInfo(request);
+    NSString *actualSign = signValue ?: @"<none>";
+    NSString *computedSign = signInfo[@"sign"];
+    NSString *note = @"request";
+    NSMutableString *extra = [NSMutableString string];
+    if (computedSign.length > 0) {
+        BOOL matched = [computedSign caseInsensitiveCompare:actualSign] == NSOrderedSame;
+        note = matched ? @"sign-ok" : @"sign-miss";
+        [extra appendFormat:@"\nComputedSign: %@", computedSign];
+        [extra appendFormat:@"\nSignMatch: %@", matched ? @"YES" : @"NO"];
+        [extra appendFormat:@"\nPath: %@", signInfo[@"path"] ?: @"<nil>"];
+        [extra appendFormat:@"\nTimestamp: %@", signInfo[@"timestamp"] ?: @"<nil>"];
+        [extra appendFormat:@"\nVersion: %@", signInfo[@"version"] ?: @"<nil>"];
+        [extra appendFormat:@"\nToken: %@", signInfo[@"token"] ?: @"<nil>"];
+        [extra appendFormat:@"\nRaw: %@", signInfo[@"raw"] ?: @"<nil>"];
+    } else if (signInfo.count > 0) {
+        note = @"need-token";
+        [extra appendFormat:@"\nPartialInfo: %@", signInfo];
+    }
+
+    NSString *logMessage = [NSString stringWithFormat:@"[Request %@ #%lld]\n%@ %@\nHost: %@\nHeaders: %@\nBody: %@\nActualSign: %@%@",
+                            source,
+                            requestHits,
+                            request.HTTPMethod ?: @"GET",
+                            request.URL.absoluteString ?: @"<nil-url>",
+                            host.length > 0 ? host : @"<nil-host>",
+                            headers,
+                            bodyPreview,
+                            actualSign,
+                            extra];
+
+    NSLog(@"[SHA256_HOOK_REQUEST]\n%@", logMessage);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SHAFloatingWindow *window = [SHAFloatingWindow shared];
+        [window updateStatusWithRawHits:rawHits
+                              shownHits:shownHits
+                            requestHits:requestHits
+                             lastSource:source
+                                   note:note];
+        [window addLog:logMessage];
+    });
+}
 
 static void process_sha256(const void *data, size_t len, unsigned char *digest, NSString *source) {
     if (!data || !digest) {
@@ -276,31 +523,23 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     }
 
     long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 1);
-
-    NSData *inputData = [NSData dataWithBytes:data length:len];
-    NSString *inputString = [[NSString alloc] initWithData:inputData encoding:NSUTF8StringEncoding];
-    if (!inputString) {
-        inputString = [NSString stringWithFormat:@"<Binary Data: %zu bytes>", len];
-    }
-
-    BOOL passesKeywordFilter = ([inputString containsString:@"appSecret="] ||
-                                [inputString containsString:@"qiekj.com"]);
-
+    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 0);
+    NSString *inputString = stringFromBytes(data, len);
+    BOOL keywordMatch = ([inputString containsString:@"appSecret="] ||
+                         [inputString containsString:@"qiekj.com"]);
+    BOOL debugSample = (rawHits <= 12);
+    BOOL passesDisplayFilter = keywordMatch || debugSample;
     long long shownHitsSnapshot = __sync_add_and_fetch(&gShownHookHitCount, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         [[SHAFloatingWindow shared] updateStatusWithRawHits:rawHits
                                                   shownHits:shownHitsSnapshot
+                                                requestHits:requestHits
                                                  lastSource:source
-                                                       note:(passesKeywordFilter ? @"matched" : @"filtered")];
+                                                       note:(keywordMatch ? @"matched" : (debugSample ? @"sample" : @"filtered"))];
     });
 
-    if (!passesKeywordFilter) {
+    if (!passesDisplayFilter) {
         return;
-    }
-
-    NSMutableString *hashString = [NSMutableString stringWithCapacity:64];
-    for (int i = 0; i < 32; i++) {
-        [hashString appendFormat:@"%02x", digest[i]];
     }
 
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown.bundle";
@@ -325,29 +564,11 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
                             timestamp,
                             bundleId,
                             inputString,
-                            hashString,
+                            digestHexString(digest, 32),
                             [filteredStack componentsJoinedByString:@"\n"]];
 
     NSLog(@"[SHA256_HOOK]\n%@", logMessage);
-
-    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *logFilePath = [documentsPath stringByAppendingPathComponent:@"CryptoHook.txt"];
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    NSString *fileLogString = [logMessage stringByAppendingString:@"\n\n----------------------------\n"];
-    if (!fileHandle) {
-        [fileLogString writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } else {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[fileLogString dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
-    }
-
-    long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        SHAFloatingWindow *window = [SHAFloatingWindow shared];
-        [window updateStatusWithRawHits:rawHits shownHits:shownHits lastSource:source note:@"shown"];
-        [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath]];
-    });
+    appendLogMessage(logMessage, source, (keywordMatch ? @"shown" : @"sample"), rawHits);
 }
 
 struct ccdigest_info {
@@ -411,7 +632,6 @@ static void my_ccdigest_final(const struct ccdigest_info *di, void *ctx, unsigne
     }
 }
 
-static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
 static unsigned char *my_CC_SHA256(const void *data, CC_LONG len, unsigned char *md) {
     unsigned char *ret = orig_CC_SHA256(data, len, md);
     if (ret) {
@@ -469,6 +689,32 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
     NSLog(@"[SHA256_HOOK] Hit Swift CryptoKit.SHA256 wrapper");
     orig_cryptokit_sha256(a, b, c);
 }
+
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    logInterestingRequest(request, @"NSURLSession");
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    logInterestingRequest(request, @"NSURLSession");
+    return %orig;
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
+                                         fromData:(NSData *)bodyData
+                                completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    NSMutableURLRequest *mutableRequest = [request mutableCopy];
+    if (bodyData.length > 0 && !mutableRequest.HTTPBody) {
+        mutableRequest.HTTPBody = bodyData;
+    }
+    logInterestingRequest(mutableRequest ?: request, @"NSURLUpload");
+    return %orig;
+}
+
+%end
 
 %ctor {
     incrementalBuffers = [NSMutableDictionary dictionary];
