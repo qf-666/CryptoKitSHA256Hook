@@ -101,7 +101,7 @@
     [self.headerView addGestureRecognizer:pan];
 
     self.titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    self.titleLabel.text = @"SHA256 Hook";
+    self.titleLabel.text = @"QE Sign Trace";
     self.titleLabel.textColor = [UIColor whiteColor];
     self.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
     [self.headerView addSubview:self.titleLabel];
@@ -275,7 +275,7 @@
                     requestHits:(long long)requestHits
                      lastSource:(NSString *)lastSource
                            note:(NSString *)note {
-    self.statusLabel.text = [NSString stringWithFormat:@"Raw %lld | Show %lld | Req %lld\n%@ | %@",
+    self.statusLabel.text = [NSString stringWithFormat:@"Hash %lld | Show %lld | Req %lld\n%@ | %@",
                              rawHits,
                              shownHits,
                              requestHits,
@@ -296,6 +296,13 @@
 static long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
 static long long gRequestHitCount = 0;
+static BOOL gDidLogQiekjRuleSummary = NO;
+
+static NSString *const kQiekjSignTemplate = @"appSecret=%@&channel=%@&timestamp=%@&token=%@&version=%@&%@";
+static NSString *const kQiekjSignSecret = @"boPSJlBfm3Ff7Fha1UcLskRNsEOZzyNwQ68c9T/k2UQ=";
+static NSString *const kQiekjSignEntryChain = @"QEGetAppSignHybird -> sub_100C524CC/sub_100C5180C -> sub_100C37EB0";
+static NSString *const kQiekjSignAlgorithm = @"CryptoKit.SHA256";
+static NSString *const kQiekjPathRule = @"strip https://userapi.qiekj.com/ -> drop query -> keep leading slash";
 
 static NSMutableDictionary *incrementalBuffers;
 static NSLock *incrementalLock;
@@ -350,13 +357,16 @@ static NSString *headerValue(NSURLRequest *request, NSString *targetKey) {
     return nil;
 }
 
-static NSString *currentUserToken(void) {
+static NSDictionary<NSString *, NSString *> *currentUserTokenInfo(void) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSArray<NSString *> *candidateKeys = @[@"KUserToken", @"userToken", @"token", @"kUserToken"];
     for (NSString *key in candidateKeys) {
         id value = [defaults objectForKey:key];
         if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-            return (NSString *)value;
+            return @{
+                @"value": (NSString *)value,
+                @"source": [NSString stringWithFormat:@"NSUserDefaults[%@]", key]
+            };
         }
     }
 
@@ -365,11 +375,25 @@ static NSString *currentUserToken(void) {
         if ([[key lowercaseString] containsString:@"token"]) {
             id value = allValues[key];
             if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-                return (NSString *)value;
+                return @{
+                    @"value": (NSString *)value,
+                    @"source": [NSString stringWithFormat:@"NSUserDefaults[%@]", key]
+                };
             }
         }
     }
-    return nil;
+    return @{
+        @"value": @"",
+        @"source": @"NSUserDefaults[token*] missing"
+    };
+}
+
+static NSDictionary<NSString *, NSString *> *currentAppVersionInfo(void) {
+    NSString *version = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
+    return @{
+        @"value": version ?: @"",
+        @"source": @"NSBundle.mainBundle[CFBundleShortVersionString]"
+    };
 }
 
 static NSString *sha256HexForString(NSString *rawString) {
@@ -387,7 +411,25 @@ static NSString *sha256HexForString(NSString *rawString) {
 }
 
 static NSString *normalizedQiekjPath(NSURLRequest *request) {
-    NSString *path = request.URL.path ?: @"";
+    NSString *absoluteURL = request.URL.absoluteString ?: @"";
+    NSString *path = absoluteURL;
+    NSString *prefix = @"https://userapi.qiekj.com/";
+    NSRange prefixRange = [absoluteURL rangeOfString:prefix options:NSCaseInsensitiveSearch];
+    if (prefixRange.location != NSNotFound) {
+        NSUInteger start = prefixRange.location + prefixRange.length;
+        if (start > 0) {
+            start -= 1;
+        }
+        path = [absoluteURL substringFromIndex:MIN(start, absoluteURL.length)];
+    } else {
+        path = request.URL.path ?: @"";
+    }
+
+    NSRange queryRange = [path rangeOfString:@"?"];
+    if (queryRange.location != NSNotFound) {
+        path = [path substringToIndex:queryRange.location];
+    }
+
     if (path.length == 0) {
         return nil;
     }
@@ -406,25 +448,38 @@ static NSDictionary<NSString *, NSString *> *computedQiekjSignInfo(NSURLRequest 
     NSString *timestamp = headerValue(request, @"timestamp");
     NSString *channel = headerValue(request, @"channel") ?: @"ios_app";
     NSString *version = headerValue(request, @"version");
+    NSString *versionSource = @"HTTP header[version]";
     if (version.length == 0) {
-        version = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
+        NSDictionary<NSString *, NSString *> *versionInfo = currentAppVersionInfo();
+        version = versionInfo[@"value"];
+        versionSource = versionInfo[@"source"];
     }
-    NSString *token = currentUserToken();
+    NSDictionary<NSString *, NSString *> *tokenInfo = currentUserTokenInfo();
+    NSString *token = tokenInfo[@"value"];
+    NSString *tokenSource = tokenInfo[@"source"];
     NSString *path = normalizedQiekjPath(request);
+    NSMutableDictionary<NSString *, NSString *> *info = [@{
+        @"algorithm": kQiekjSignAlgorithm,
+        @"entryChain": kQiekjSignEntryChain,
+        @"template": kQiekjSignTemplate,
+        @"secret": kQiekjSignSecret,
+        @"pathRule": kQiekjPathRule,
+        @"tokenSource": tokenSource ?: @"<unknown>",
+        @"versionSource": versionSource ?: @"<unknown>"
+    } mutableCopy];
+
+    if (timestamp.length > 0) info[@"timestamp"] = timestamp;
+    if (channel.length > 0) info[@"channel"] = channel;
+    if (version.length > 0) info[@"version"] = version;
+    if (token.length > 0) info[@"token"] = token;
+    if (path.length > 0) info[@"path"] = path;
 
     if (timestamp.length == 0 || channel.length == 0 || version.length == 0 || token.length == 0 || path.length == 0) {
-        NSMutableDictionary *info = [NSMutableDictionary dictionary];
-        if (timestamp.length > 0) info[@"timestamp"] = timestamp;
-        if (channel.length > 0) info[@"channel"] = channel;
-        if (version.length > 0) info[@"version"] = version;
-        if (token.length > 0) info[@"token"] = token;
-        if (path.length > 0) info[@"path"] = path;
         return info;
     }
 
-    NSString *secret = @"boPSJlBfm3Ff7Fha1UcLskRNsEOZzyNwQ68c9T/k2UQ=";
-    NSString *raw = [NSString stringWithFormat:@"appSecret=%@&channel=%@&timestamp=%@&token=%@&version=%@&%@",
-                     secret,
+    NSString *raw = [NSString stringWithFormat:kQiekjSignTemplate,
+                     kQiekjSignSecret,
                      channel,
                      timestamp,
                      token,
@@ -435,15 +490,35 @@ static NSDictionary<NSString *, NSString *> *computedQiekjSignInfo(NSURLRequest 
         return nil;
     }
 
-    return @{
-        @"timestamp": timestamp,
-        @"channel": channel,
-        @"version": version,
-        @"token": token,
-        @"path": path,
-        @"raw": raw,
-        @"sign": sign
-    };
+    info[@"raw"] = raw;
+    info[@"sign"] = sign;
+    return info;
+}
+
+static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
+
+static void logQiekjRuleSummaryIfNeeded(long long rawHits) {
+    if (gDidLogQiekjRuleSummary) {
+        return;
+    }
+    gDidLogQiekjRuleSummary = YES;
+
+    NSString *summary = [NSString stringWithFormat:
+                         @"[QE Sign Rule]\n"
+                         @"Source: IDA-MCP\n"
+                         @"Entry: %@\n"
+                         @"Hash: %@\n"
+                         @"Template: %@\n"
+                         @"Secret: %@\n"
+                         @"PathRule: %@\n"
+                         @"TokenSource: sub_1004BA88C -> KUserToken\n"
+                         @"VersionSource: sub_100079FB8 -> NSBundle.mainBundle -> CFBundleShortVersionString",
+                         kQiekjSignEntryChain,
+                         kQiekjSignAlgorithm,
+                         kQiekjSignTemplate,
+                         kQiekjSignSecret,
+                         kQiekjPathRule];
+    appendLogMessage(summary, @"IDA-MCP", @"qe-rule", rawHits);
 }
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits) {
@@ -488,6 +563,7 @@ static void logInterestingRequest(NSURLRequest *request, NSString *source) {
 
     long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 1);
     long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+    logQiekjRuleSummaryIfNeeded(rawHits);
 
     NSData *bodyData = request.HTTPBody;
     NSString *bodyPreview = bodyData ? stringFromBytes(bodyData.bytes, bodyData.length) : @"<none>";
@@ -500,6 +576,14 @@ static void logInterestingRequest(NSURLRequest *request, NSString *source) {
     NSString *computedSign = signInfo[@"sign"];
     NSString *note = @"request";
     NSMutableString *extra = [NSMutableString string];
+    [extra appendString:@"\nRuleSource: IDA-MCP"];
+    [extra appendFormat:@"\nEntryChain: %@", signInfo[@"entryChain"] ?: kQiekjSignEntryChain];
+    [extra appendFormat:@"\nHashAlgorithm: %@", signInfo[@"algorithm"] ?: kQiekjSignAlgorithm];
+    [extra appendFormat:@"\nTemplate: %@", signInfo[@"template"] ?: kQiekjSignTemplate];
+    [extra appendFormat:@"\nSecret: %@", signInfo[@"secret"] ?: kQiekjSignSecret];
+    [extra appendFormat:@"\nPathRule: %@", signInfo[@"pathRule"] ?: kQiekjPathRule];
+    [extra appendFormat:@"\nTokenSource: %@", signInfo[@"tokenSource"] ?: @"<unknown>"];
+    [extra appendFormat:@"\nVersionSource: %@", signInfo[@"versionSource"] ?: @"<unknown>"];
     if (computedSign.length > 0) {
         BOOL matched = [computedSign caseInsensitiveCompare:actualSign] == NSOrderedSame;
         note = matched ? @"sign-ok" : @"sign-miss";
