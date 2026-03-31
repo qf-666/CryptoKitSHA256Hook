@@ -302,14 +302,17 @@ static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned 
 static BOOL gDidInstallCryptoKitWrapper = NO;
 
 static NSString *const kThreadSourceHintKey = @"CryptoKitSHA256Hook.SourceHint";
+static NSString *const kThreadUTF8CandidateTextKey = @"CryptoKitSHA256Hook.UTF8CandidateText";
+static NSString *const kThreadUTF8CandidateSourceKey = @"CryptoKitSHA256Hook.UTF8CandidateSource";
+static NSString *const kThreadUTF8CandidateBytesKey = @"CryptoKitSHA256Hook.UTF8CandidateBytes";
+static NSString *const kThreadUTF8CandidateLoggedKey = @"CryptoKitSHA256Hook.UTF8CandidateLogged";
 
 static NSString *utf8StringFromBytes(const void *bytes, size_t length) {
     if (!bytes || length == 0) {
         return @"";
     }
 
-    NSData *data = [NSData dataWithBytes:bytes length:length];
-    NSString *utf8 = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    NSString *utf8 = [[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding];
     return utf8.length > 0 ? utf8 : nil;
 }
 
@@ -340,6 +343,84 @@ static NSString *digestHexString(const unsigned char *digest, size_t length) {
         [hashString appendFormat:@"%02x", digest[i]];
     }
     return hashString;
+}
+
+static NSString *sha256HexForData(NSData *data) {
+    if (data.length == 0) {
+        return @"<empty-input>";
+    }
+
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {0};
+    if (orig_CC_SHA256) {
+        orig_CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    } else {
+        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    }
+    return digestHexString(digest, CC_SHA256_DIGEST_LENGTH);
+}
+
+static BOOL isLikelyDisplayableUTF8(NSString *text) {
+    if (text.length == 0 || text.length > 4096) {
+        return NO;
+    }
+    if ([text hasPrefix:@"[SHA256"] ||
+        [text hasPrefix:@"[Generic SHA256 Hook]"] ||
+        [text hasPrefix:@"[Saved]"]) {
+        return NO;
+    }
+
+    NSUInteger suspiciousCount = 0;
+    for (NSUInteger i = 0; i < text.length; i++) {
+        unichar ch = [text characterAtIndex:i];
+        BOOL allowedControl = (ch == '\n' || ch == '\r' || ch == '\t');
+        if (ch < 0x20 && !allowedControl) {
+            suspiciousCount++;
+        }
+    }
+    return suspiciousCount == 0;
+}
+
+static void rememberThreadUTF8Candidate(NSString *text, NSData *bytes, NSString *source) {
+    if (!isLikelyDisplayableUTF8(text) || bytes.length == 0) {
+        return;
+    }
+
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    threadInfo[kThreadUTF8CandidateTextKey] = [text copy];
+    threadInfo[kThreadUTF8CandidateSourceKey] = source ?: @"unknown";
+    threadInfo[kThreadUTF8CandidateBytesKey] = [bytes copy];
+    [threadInfo removeObjectForKey:kThreadUTF8CandidateLoggedKey];
+}
+
+static void rememberThreadUTF8CandidateFromBytes(const void *bytes, size_t length, NSString *source) {
+    NSString *text = utf8StringFromBytes(bytes, length);
+    if (text.length == 0) {
+        return;
+    }
+
+    NSData *data = [[NSData alloc] initWithBytesNoCopy:(void *)bytes length:length freeWhenDone:NO];
+    rememberThreadUTF8Candidate(text, data, source);
+}
+
+static NSDictionary<NSString *, id> *currentThreadUTF8Candidate(void) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    NSString *text = threadInfo[kThreadUTF8CandidateTextKey];
+    NSData *bytes = threadInfo[kThreadUTF8CandidateBytesKey];
+    if (text.length == 0 || bytes.length == 0) {
+        return nil;
+    }
+
+    return @{
+        @"text": text,
+        @"bytes": bytes,
+        @"source": threadInfo[kThreadUTF8CandidateSourceKey] ?: @"unknown",
+        @"logged": threadInfo[kThreadUTF8CandidateLoggedKey] ?: @NO
+    };
+}
+
+static void markThreadUTF8CandidateLogged(void) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    threadInfo[kThreadUTF8CandidateLoggedKey] = @YES;
 }
 
 static NSString *setThreadSourceHint(NSString *hint) {
@@ -395,6 +476,59 @@ static NSString *filteredStackTrace(void) {
 }
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
+static void maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(NSString *source);
+
+static void appendUTF8CandidateLog(NSDictionary<NSString *, id> *candidate, NSString *source, NSString *meaning, NSString *note) {
+    NSString *text = candidate[@"text"];
+    NSData *bytes = candidate[@"bytes"];
+    if (text.length == 0 || bytes.length == 0) {
+        return;
+    }
+
+    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 1);
+    __sync_add_and_fetch(&gUTF8HitCount, 1);
+    NSString *resolvedSource = resolvedSourceName(source);
+    NSString *candidateSource = candidate[@"source"] ?: @"unknown";
+    NSString *logMessage = [NSString stringWithFormat:
+                            @"[SHA256 UTF8 Bridge #%lld]\n"
+                            @"Source: %@\n"
+                            @"BridgeSource: %@\n"
+                            @"Algorithm: SHA-256\n"
+                            @"Meaning: %@\n"
+                            @"InputLength: %lu\n"
+                            @"InputType: UTF-8 text\n"
+                            @"Plaintext: %@\n"
+                            @"HexPreview: %@\n"
+                            @"Hash(Local): %@\n"
+                            @"Stack:\n%@",
+                            rawHits,
+                            resolvedSource,
+                            candidateSource,
+                            meaning ?: @"runtime UTF-8 candidate before SHA256",
+                            (unsigned long)bytes.length,
+                            text,
+                            hexPreviewFromBytes(bytes.bytes, bytes.length, 96),
+                            sha256HexForData(bytes),
+                            filteredStackTrace()];
+    appendLogMessage(logMessage, resolvedSource, note ?: @"utf8-bridge", rawHits);
+    markThreadUTF8CandidateLogged();
+}
+
+static void maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(NSString *source) {
+    if (gDidInstallCryptoKitWrapper) {
+        return;
+    }
+
+    NSDictionary<NSString *, id> *candidate = currentThreadUTF8Candidate();
+    if ([candidate[@"logged"] boolValue] || !candidate[@"text"]) {
+        return;
+    }
+
+    appendUTF8CandidateLog(candidate,
+                           source ?: @"UTF8Bridge",
+                           @"runtime UTF-8 candidate on device without CryptoKit wrapper symbol",
+                           @"utf8-bridge-fallback");
+}
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits) {
     NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -433,6 +567,7 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     BOOL hasUTF8Text = (utf8String.length > 0);
     if (hasUTF8Text) {
         __sync_add_and_fetch(&gUTF8HitCount, 1);
+        rememberThreadUTF8CandidateFromBytes(data, len, source ?: @"SHA256Input");
     }
 
     BOOL debugBinarySample = (!hasUTF8Text && rawHits <= 8);
@@ -600,11 +735,62 @@ static void (*orig_cryptokit_sha256)(void *a, void *b, void *c);
 static void my_cryptokit_sha256(void *a, void *b, void *c) {
     NSString *previousHint = setThreadSourceHint(@"CryptoKit.SHA256");
     @try {
+        NSDictionary<NSString *, id> *candidate = currentThreadUTF8Candidate();
+        if ([candidate[@"logged"] boolValue] == NO && candidate[@"text"]) {
+            appendUTF8CandidateLog(candidate,
+                                   @"CryptoKit.SHA256",
+                                   @"runtime UTF-8 candidate immediately before CryptoKit.SHA256",
+                                   @"cryptokit-bridge");
+        }
         orig_cryptokit_sha256(a, b, c);
     } @finally {
         restoreThreadSourceHint(previousHint);
     }
 }
+
+%hook NSString
+
+- (NSData *)dataUsingEncoding:(NSStringEncoding)encoding {
+    NSData *result = %orig;
+    if (encoding == NSUTF8StringEncoding && result.length > 0) {
+        rememberThreadUTF8Candidate(self, result, @"NSString.dataUsingEncoding");
+        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSString.dataUsingEncoding");
+    }
+    return result;
+}
+
+- (NSData *)dataUsingEncoding:(NSStringEncoding)encoding allowLossyConversion:(BOOL)lossyConversion {
+    NSData *result = %orig;
+    if (encoding == NSUTF8StringEncoding && result.length > 0) {
+        rememberThreadUTF8Candidate(self, result, @"NSString.dataUsingEncoding(lossy)");
+        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSString.dataUsingEncoding(lossy)");
+    }
+    return result;
+}
+
+%end
+
+%hook NSData
+
++ (instancetype)dataWithBytes:(const void *)bytes length:(NSUInteger)length {
+    id result = %orig;
+    if (bytes && length > 0) {
+        rememberThreadUTF8CandidateFromBytes(bytes, length, @"NSData.dataWithBytes");
+        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSData.dataWithBytes");
+    }
+    return result;
+}
+
+- (instancetype)initWithBytes:(const void *)bytes length:(NSUInteger)length {
+    id result = %orig;
+    if (bytes && length > 0) {
+        rememberThreadUTF8CandidateFromBytes(bytes, length, @"NSData.initWithBytes");
+        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSData.initWithBytes");
+    }
+    return result;
+}
+
+%end
 
 %ctor {
     incrementalBuffers = [NSMutableDictionary dictionary];
