@@ -579,7 +579,7 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
             NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
             if (fileHandle) {
                 [fileHandle seekToEndOfFile];
-                [fileHandle writeData:fileLogData];
+                [fileHandle writeData:logFileData];
                 [fileHandle closeFile];
             }
         }
