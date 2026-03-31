@@ -568,7 +568,7 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
         NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         logFilePath = [documentsPath stringByAppendingPathComponent:@"CryptoHook.txt"];
         NSString *fileLogString = [logMessage stringByAppendingString:@"\n\n----------------------------\n"];
-        NSData *fileLogData = [fileLogString dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *logFileData = [fileLogString dataUsingEncoding:NSUTF8StringEncoding];
 
         if (logFileData.length > 0) {
             NSFileManager *fileManager = [NSFileManager defaultManager];
