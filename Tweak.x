@@ -306,6 +306,7 @@ static NSString *const kThreadUTF8CandidateTextKey = @"CryptoKitSHA256Hook.UTF8C
 static NSString *const kThreadUTF8CandidateSourceKey = @"CryptoKitSHA256Hook.UTF8CandidateSource";
 static NSString *const kThreadUTF8CandidateBytesKey = @"CryptoKitSHA256Hook.UTF8CandidateBytes";
 static NSString *const kThreadUTF8CandidateLoggedKey = @"CryptoKitSHA256Hook.UTF8CandidateLogged";
+static NSString *const kThreadBridgeSuppressionDepthKey = @"CryptoKitSHA256Hook.BridgeSuppressionDepth";
 
 static NSString *utf8StringFromBytes(const void *bytes, size_t length) {
     if (!bytes || length == 0) {
@@ -380,8 +381,32 @@ static BOOL isLikelyDisplayableUTF8(NSString *text) {
     return suspiciousCount == 0;
 }
 
+static NSInteger currentThreadCounter(NSString *key) {
+    return [[[[NSThread currentThread] threadDictionary] objectForKey:key] integerValue];
+}
+
+static BOOL isBridgeSuppressed(void) {
+    return currentThreadCounter(kThreadBridgeSuppressionDepthKey) > 0;
+}
+
+static void pushBridgeSuppression(void) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    NSInteger depth = [threadInfo[kThreadBridgeSuppressionDepthKey] integerValue];
+    threadInfo[kThreadBridgeSuppressionDepthKey] = @(depth + 1);
+}
+
+static void popBridgeSuppression(void) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    NSInteger depth = [threadInfo[kThreadBridgeSuppressionDepthKey] integerValue];
+    if (depth <= 1) {
+        [threadInfo removeObjectForKey:kThreadBridgeSuppressionDepthKey];
+        return;
+    }
+    threadInfo[kThreadBridgeSuppressionDepthKey] = @(depth - 1);
+}
+
 static void rememberThreadUTF8Candidate(NSString *text, NSData *bytes, NSString *source) {
-    if (!isLikelyDisplayableUTF8(text) || bytes.length == 0) {
+    if (isBridgeSuppressed() || !isLikelyDisplayableUTF8(text) || bytes.length == 0) {
         return;
     }
 
@@ -393,6 +418,10 @@ static void rememberThreadUTF8Candidate(NSString *text, NSData *bytes, NSString 
 }
 
 static void rememberThreadUTF8CandidateFromBytes(const void *bytes, size_t length, NSString *source) {
+    if (isBridgeSuppressed()) {
+        return;
+    }
+
     NSString *text = utf8StringFromBytes(bytes, length);
     if (text.length == 0) {
         return;
@@ -421,6 +450,18 @@ static NSDictionary<NSString *, id> *currentThreadUTF8Candidate(void) {
 static void markThreadUTF8CandidateLogged(void) {
     NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
     threadInfo[kThreadUTF8CandidateLoggedKey] = @YES;
+}
+
+static NSDictionary<NSString *, id> *pendingThreadUTF8Candidate(void) {
+    if (isBridgeSuppressed()) {
+        return nil;
+    }
+
+    NSDictionary<NSString *, id> *candidate = currentThreadUTF8Candidate();
+    if ([candidate[@"logged"] boolValue] || !candidate[@"text"]) {
+        return nil;
+    }
+    return candidate;
 }
 
 static NSString *setThreadSourceHint(NSString *hint) {
@@ -455,28 +496,33 @@ static NSString *resolvedSourceName(NSString *source) {
 }
 
 static NSString *filteredStackTrace(void) {
-    NSArray *stack = [NSThread callStackSymbols];
-    NSMutableArray *filteredStack = [NSMutableArray array];
-    for (NSString *line in stack) {
-        if ([line containsString:@"libsystem"] ||
-            [line containsString:@"libdispatch"] ||
-            [line containsString:@"corecrypto"] ||
-            [line containsString:@"CydiaSubstrate"] ||
-            [line containsString:@"CryptoKit"] ||
-            [line containsString:@"Tweak"]) {
-            continue;
+    pushBridgeSuppression();
+    NSString *result = @"<stack-filtered>";
+    @try {
+        NSArray *stack = [NSThread callStackSymbols];
+        NSMutableArray *filteredStack = [NSMutableArray array];
+        for (NSString *line in stack) {
+            if ([line containsString:@"libsystem"] ||
+                [line containsString:@"libdispatch"] ||
+                [line containsString:@"corecrypto"] ||
+                [line containsString:@"CydiaSubstrate"] ||
+                [line containsString:@"CryptoKit"] ||
+                [line containsString:@"Tweak"]) {
+                continue;
+            }
+            [filteredStack addObject:line];
         }
-        [filteredStack addObject:line];
-    }
 
-    if (filteredStack.count == 0) {
-        return @"<stack-filtered>";
+        if (filteredStack.count > 0) {
+            result = [filteredStack componentsJoinedByString:@"\n"];
+        }
+    } @finally {
+        popBridgeSuppression();
     }
-    return [filteredStack componentsJoinedByString:@"\n"];
+    return result;
 }
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
-static void maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(NSString *source);
 
 static void appendUTF8CandidateLog(NSDictionary<NSString *, id> *candidate, NSString *source, NSString *meaning, NSString *note) {
     NSString *text = candidate[@"text"];
@@ -514,46 +560,48 @@ static void appendUTF8CandidateLog(NSDictionary<NSString *, id> *candidate, NSSt
     markThreadUTF8CandidateLogged();
 }
 
-static void maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(NSString *source) {
-    if (gDidInstallCryptoKitWrapper) {
-        return;
-    }
-
-    NSDictionary<NSString *, id> *candidate = currentThreadUTF8Candidate();
-    if ([candidate[@"logged"] boolValue] || !candidate[@"text"]) {
-        return;
-    }
-
-    appendUTF8CandidateLog(candidate,
-                           source ?: @"UTF8Bridge",
-                           @"runtime UTF-8 candidate on device without CryptoKit wrapper symbol",
-                           @"utf8-bridge-fallback");
-}
-
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits) {
-    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *logFilePath = [documentsPath stringByAppendingPathComponent:@"CryptoHook.txt"];
-    NSString *fileLogString = [logMessage stringByAppendingString:@"\n\n----------------------------\n"];
+    pushBridgeSuppression();
 
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    if (!fileHandle) {
-        [fileLogString writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } else {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[fileLogString dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
+    NSString *logFilePath = nil;
+    @try {
+        NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        logFilePath = [documentsPath stringByAppendingPathComponent:@"CryptoHook.txt"];
+        NSString *fileLogString = [logMessage stringByAppendingString:@"\n\n----------------------------\n"];
+        NSData *fileLogData = [fileLogString dataUsingEncoding:NSUTF8StringEncoding];
+
+        if (logFileData.length > 0) {
+            NSFileManager *fileManager = [NSFileManager defaultManager];
+            if (![fileManager fileExistsAtPath:logFilePath]) {
+                [fileManager createFileAtPath:logFilePath contents:nil attributes:nil];
+            }
+
+            NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
+            if (fileHandle) {
+                [fileHandle seekToEndOfFile];
+                [fileHandle writeData:fileLogData];
+                [fileHandle closeFile];
+            }
+        }
+    } @finally {
+        popBridgeSuppression();
     }
 
     long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
     long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
-        SHAFloatingWindow *window = [SHAFloatingWindow shared];
-        [window updateStatusWithRawHits:rawHits
-                              shownHits:shownHits
-                               utf8Hits:utf8Hits
-                             lastSource:source
-                                   note:note];
-        [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath]];
+        pushBridgeSuppression();
+        @try {
+            SHAFloatingWindow *window = [SHAFloatingWindow shared];
+            [window updateStatusWithRawHits:rawHits
+                                  shownHits:shownHits
+                                   utf8Hits:utf8Hits
+                                 lastSource:source
+                                       note:note];
+            [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath ?: @"<unknown>"]];
+        } @finally {
+            popBridgeSuppression();
+        }
     });
 }
 
@@ -570,8 +618,12 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
         rememberThreadUTF8CandidateFromBytes(data, len, source ?: @"SHA256Input");
     }
 
+    NSDictionary<NSString *, id> *bridgeCandidate = nil;
+    if (!hasUTF8Text && !gDidInstallCryptoKitWrapper) {
+        bridgeCandidate = pendingThreadUTF8Candidate();
+    }
     BOOL debugBinarySample = (!hasUTF8Text && rawHits <= 8);
-    BOOL passesDisplayFilter = hasUTF8Text || debugBinarySample;
+    BOOL passesDisplayFilter = hasUTF8Text || debugBinarySample || (bridgeCandidate != nil);
     NSString *resolvedSource = resolvedSourceName(source);
     long long shownHitsSnapshot = __sync_add_and_fetch(&gShownHookHitCount, 0);
     long long utf8HitsSnapshot = __sync_add_and_fetch(&gUTF8HitCount, 0);
@@ -580,7 +632,7 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
                                                   shownHits:shownHitsSnapshot
                                                    utf8Hits:utf8HitsSnapshot
                                                  lastSource:resolvedSource
-                                                       note:(hasUTF8Text ? @"utf8" : (debugBinarySample ? @"binary-sample" : @"binary-filtered"))];
+                                                       note:(hasUTF8Text ? @"utf8" : (bridgeCandidate ? @"utf8-bridge" : (debugBinarySample ? @"binary-sample" : @"binary-filtered")))];
     });
 
     if (!passesDisplayFilter) {
@@ -615,7 +667,18 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
                             filteredStackTrace()];
 
     NSLog(@"[SHA256_HOOK]\n%@", logMessage);
-    appendLogMessage(logMessage, resolvedSource, (hasUTF8Text ? @"utf8" : @"binary-sample"), rawHits);
+    appendLogMessage(logMessage,
+                     resolvedSource,
+                     (hasUTF8Text ? @"utf8" : (bridgeCandidate ? @"utf8-bridge" : @"binary-sample")),
+                     rawHits);
+    if (hasUTF8Text) {
+        markThreadUTF8CandidateLogged();
+    } else if (bridgeCandidate) {
+        appendUTF8CandidateLog(bridgeCandidate,
+                               resolvedSource,
+                               @"same-thread UTF-8 candidate correlated with SHA256 when direct plaintext was not observable",
+                               @"utf8-bridge-correlated");
+    }
 }
 
 struct ccdigest_info {
@@ -735,8 +798,8 @@ static void (*orig_cryptokit_sha256)(void *a, void *b, void *c);
 static void my_cryptokit_sha256(void *a, void *b, void *c) {
     NSString *previousHint = setThreadSourceHint(@"CryptoKit.SHA256");
     @try {
-        NSDictionary<NSString *, id> *candidate = currentThreadUTF8Candidate();
-        if ([candidate[@"logged"] boolValue] == NO && candidate[@"text"]) {
+        NSDictionary<NSString *, id> *candidate = pendingThreadUTF8Candidate();
+        if (candidate) {
             appendUTF8CandidateLog(candidate,
                                    @"CryptoKit.SHA256",
                                    @"runtime UTF-8 candidate immediately before CryptoKit.SHA256",
@@ -752,40 +815,16 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
 
 - (NSData *)dataUsingEncoding:(NSStringEncoding)encoding {
     NSData *result = %orig;
-    if (encoding == NSUTF8StringEncoding && result.length > 0) {
+    if (!isBridgeSuppressed() && encoding == NSUTF8StringEncoding && result.length > 0) {
         rememberThreadUTF8Candidate(self, result, @"NSString.dataUsingEncoding");
-        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSString.dataUsingEncoding");
     }
     return result;
 }
 
 - (NSData *)dataUsingEncoding:(NSStringEncoding)encoding allowLossyConversion:(BOOL)lossyConversion {
     NSData *result = %orig;
-    if (encoding == NSUTF8StringEncoding && result.length > 0) {
+    if (!isBridgeSuppressed() && encoding == NSUTF8StringEncoding && result.length > 0) {
         rememberThreadUTF8Candidate(self, result, @"NSString.dataUsingEncoding(lossy)");
-        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSString.dataUsingEncoding(lossy)");
-    }
-    return result;
-}
-
-%end
-
-%hook NSData
-
-+ (instancetype)dataWithBytes:(const void *)bytes length:(NSUInteger)length {
-    id result = %orig;
-    if (bytes && length > 0) {
-        rememberThreadUTF8CandidateFromBytes(bytes, length, @"NSData.dataWithBytes");
-        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSData.dataWithBytes");
-    }
-    return result;
-}
-
-- (instancetype)initWithBytes:(const void *)bytes length:(NSUInteger)length {
-    id result = %orig;
-    if (bytes && length > 0) {
-        rememberThreadUTF8CandidateFromBytes(bytes, length, @"NSData.initWithBytes");
-        maybeLogThreadUTF8CandidateWithoutCryptoKitWrapper(@"NSData.initWithBytes");
     }
     return result;
 }
@@ -867,6 +906,7 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
                                     @"OneShot: CC_SHA256\n"
                                     @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
                                     @"CryptoKitWrapper: %@\n"
+                                    @"UTF8Bridge: deferred correlate on SHA hit\n"
                                     @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
                                     gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
         appendLogMessage(startupMessage,
