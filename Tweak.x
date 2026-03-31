@@ -1,7 +1,5 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import "fishhook.h"
 
@@ -21,7 +19,7 @@
 - (void)addLog:(NSString *)log;
 - (void)updateStatusWithRawHits:(long long)rawHits
                       shownHits:(long long)shownHits
-                    requestHits:(long long)requestHits
+                       utf8Hits:(long long)utf8Hits
                      lastSource:(NSString *)lastSource
                            note:(NSString *)note;
 @end
@@ -102,7 +100,7 @@
     [self.headerView addGestureRecognizer:pan];
 
     self.titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    self.titleLabel.text = @"QE Sign Trace";
+    self.titleLabel.text = @"SHA256 Blind Trace";
     self.titleLabel.textColor = [UIColor whiteColor];
     self.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
     [self.headerView addSubview:self.titleLabel];
@@ -152,7 +150,7 @@
     [self.panelView addSubview:self.textView];
 
     [self.rootViewController.view addSubview:self.panelView];
-    [self updateStatusWithRawHits:0 shownHits:0 requestHits:0 lastSource:@"Loaded" note:@"ready"];
+    [self updateStatusWithRawHits:0 shownHits:0 utf8Hits:0 lastSource:@"Loaded" note:@"ready"];
 
     self.hidden = NO;
     [self setNeedsLayout];
@@ -273,13 +271,13 @@
 
 - (void)updateStatusWithRawHits:(long long)rawHits
                       shownHits:(long long)shownHits
-                    requestHits:(long long)requestHits
+                       utf8Hits:(long long)utf8Hits
                      lastSource:(NSString *)lastSource
                            note:(NSString *)note {
-    self.statusLabel.text = [NSString stringWithFormat:@"Hash %lld | Show %lld | Req %lld\n%@ | %@",
+    self.statusLabel.text = [NSString stringWithFormat:@"Hook %lld | Show %lld | UTF8 %lld\n%@ | %@",
                              rawHits,
                              shownHits,
-                             requestHits,
+                             utf8Hits,
                              lastSource ?: @"-",
                              note ?: @"-"];
 }
@@ -296,60 +294,40 @@
 
 static long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
-static long long gRequestHitCount = 0;
-static long long gBusinessRawHitCount = 0;
-static BOOL gDidLogQiekjRuleSummary = NO;
-
-static NSString *const kQiekjSignTemplate = @"appSecret=%@&channel=%@&timestamp=%@&token=%@&version=%@&%@";
-static NSString *const kQiekjSignSecret = @"boPSJlBfm3Ff7Fha1UcLskRNsEOZzyNwQ68c9T/k2UQ=";
-static NSString *const kQiekjSignEntryChain = @"QEGetAppSignHybird -> sub_100C524CC/sub_100C5180C -> sub_100C37EB0";
-static NSString *const kQiekjSignAlgorithm = @"CryptoKit.SHA256";
-static NSString *const kQiekjPathRule = @"strip https://userapi.qiekj.com/ -> drop query -> keep leading slash";
+static long long gUTF8HitCount = 0;
 
 static NSMutableDictionary *incrementalBuffers;
 static NSLock *incrementalLock;
-static NSMutableDictionary *incrementalHmacBuffers;
-static NSMutableDictionary *incrementalHmacKeys;
-static NSLock *incrementalHmacLock;
-static NSLock *businessTraceLock;
-static NSString *gLastBusinessRaw = nil;
-static NSString *gLastBusinessHash = nil;
 static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
+static BOOL gDidInstallCryptoKitWrapper = NO;
 
-typedef struct {
-    uint64_t word0;
-    uint64_t word1;
-} SwiftPair;
+static NSString *const kThreadSourceHintKey = @"CryptoKitSHA256Hook.SourceHint";
 
-typedef NSString *(*SwiftStringToNSStringFunc)(SwiftPair value);
-typedef SwiftPair (*SwiftStringToDataFunc)(SwiftPair value);
-
-static SwiftStringToNSStringFunc gSwiftStringToNSString = NULL;
-static SwiftStringToDataFunc orig_qe_string_to_data = NULL;
-
-static const uint64_t kQEStringToDataEA = 0x100C36D54ULL;
-
-static NSString *stringFromBytes(const void *bytes, size_t length) {
+static NSString *utf8StringFromBytes(const void *bytes, size_t length) {
     if (!bytes || length == 0) {
-        return @"<empty>";
+        return @"";
     }
 
     NSData *data = [NSData dataWithBytes:bytes length:length];
     NSString *utf8 = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (utf8.length > 0) {
-        return utf8;
+    return utf8.length > 0 ? utf8 : nil;
+}
+
+static NSString *hexPreviewFromBytes(const void *bytes, size_t length, NSUInteger maxBytes) {
+    if (!bytes || length == 0) {
+        return @"<empty>";
     }
 
-    NSUInteger previewLength = MIN((NSUInteger)length, (NSUInteger)48);
+    NSUInteger previewLength = MIN((NSUInteger)length, maxBytes);
     const unsigned char *raw = (const unsigned char *)bytes;
     NSMutableString *hex = [NSMutableString stringWithCapacity:(previewLength * 2) + 16];
     for (NSUInteger i = 0; i < previewLength; i++) {
         [hex appendFormat:@"%02x", raw[i]];
     }
-    if (length > previewLength) {
+    if ((NSUInteger)length > previewLength) {
         [hex appendString:@"..."];
     }
-    return [NSString stringWithFormat:@"<hex:%@>", hex];
+    return hex;
 }
 
 static NSString *digestHexString(const unsigned char *digest, size_t length) {
@@ -364,239 +342,59 @@ static NSString *digestHexString(const unsigned char *digest, size_t length) {
     return hashString;
 }
 
-static NSString *headerValue(NSURLRequest *request, NSString *targetKey) {
-    NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
-    for (NSString *key in headers) {
-        if ([key caseInsensitiveCompare:targetKey] == NSOrderedSame) {
-            id value = headers[key];
-            return [value isKindOfClass:[NSString class]] ? (NSString *)value : [value description];
-        }
-    }
-    return nil;
-}
-
-static NSDictionary<NSString *, NSString *> *currentUserTokenInfo(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSArray<NSString *> *candidateKeys = @[@"KUserToken", @"userToken", @"token", @"kUserToken"];
-    for (NSString *key in candidateKeys) {
-        id value = [defaults objectForKey:key];
-        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-            return @{
-                @"value": (NSString *)value,
-                @"source": [NSString stringWithFormat:@"NSUserDefaults[%@]", key]
-            };
-        }
-    }
-
-    NSDictionary *allValues = [defaults dictionaryRepresentation];
-    for (NSString *key in allValues) {
-        if ([[key lowercaseString] containsString:@"token"]) {
-            id value = allValues[key];
-            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-                return @{
-                    @"value": (NSString *)value,
-                    @"source": [NSString stringWithFormat:@"NSUserDefaults[%@]", key]
-                };
-            }
-        }
-    }
-    return @{
-        @"value": @"",
-        @"source": @"NSUserDefaults[token*] missing"
-    };
-}
-
-static NSDictionary<NSString *, NSString *> *currentAppVersionInfo(void) {
-    NSString *version = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
-    return @{
-        @"value": version ?: @"",
-        @"source": @"NSBundle.mainBundle[CFBundleShortVersionString]"
-    };
-}
-
-static NSString *sha256HexForString(NSString *rawString) {
-    if (!rawString) {
-        return nil;
-    }
-    NSData *data = [rawString dataUsingEncoding:NSUTF8StringEncoding];
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {0};
-    if (orig_CC_SHA256) {
-        orig_CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+static NSString *setThreadSourceHint(NSString *hint) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    NSString *previousHint = threadInfo[kThreadSourceHintKey];
+    if (hint.length > 0) {
+        threadInfo[kThreadSourceHintKey] = hint;
     } else {
-        CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+        [threadInfo removeObjectForKey:kThreadSourceHintKey];
     }
-    return digestHexString(digest, CC_SHA256_DIGEST_LENGTH);
+    return previousHint;
 }
 
-static NSString *stringFromSwiftString(SwiftPair value) {
-    if (!gSwiftStringToNSString) {
-        return nil;
-    }
-    @try {
-        return gSwiftStringToNSString(value);
-    } @catch (__unused NSException *exception) {
-        return nil;
+static void restoreThreadSourceHint(NSString *previousHint) {
+    NSMutableDictionary *threadInfo = [[NSThread currentThread] threadDictionary];
+    if (previousHint.length > 0) {
+        threadInfo[kThreadSourceHintKey] = previousHint;
+    } else {
+        [threadInfo removeObjectForKey:kThreadSourceHintKey];
     }
 }
 
-static void storeLatestBusinessTrace(NSString *raw, NSString *hashString) {
-    if (!businessTraceLock) {
-        return;
+static NSString *resolvedSourceName(NSString *source) {
+    NSString *hint = [[[NSThread currentThread] threadDictionary] objectForKey:kThreadSourceHintKey];
+    if (hint.length == 0) {
+        return source ?: @"unknown";
     }
-    [businessTraceLock lock];
-    gLastBusinessRaw = [raw copy];
-    gLastBusinessHash = [hashString copy];
-    [businessTraceLock unlock];
+    if (source.length == 0 || [hint isEqualToString:source]) {
+        return hint;
+    }
+    return [NSString stringWithFormat:@"%@ -> %@", hint, source];
 }
 
-static NSDictionary<NSString *, NSString *> *latestBusinessTrace(void) {
-    if (!businessTraceLock) {
-        return nil;
+static NSString *filteredStackTrace(void) {
+    NSArray *stack = [NSThread callStackSymbols];
+    NSMutableArray *filteredStack = [NSMutableArray array];
+    for (NSString *line in stack) {
+        if ([line containsString:@"libsystem"] ||
+            [line containsString:@"libdispatch"] ||
+            [line containsString:@"corecrypto"] ||
+            [line containsString:@"CydiaSubstrate"] ||
+            [line containsString:@"CryptoKit"] ||
+            [line containsString:@"Tweak"]) {
+            continue;
+        }
+        [filteredStack addObject:line];
     }
-    [businessTraceLock lock];
-    NSDictionary<NSString *, NSString *> *snapshot = nil;
-    if (gLastBusinessRaw.length > 0 || gLastBusinessHash.length > 0) {
-        snapshot = @{
-            @"raw": gLastBusinessRaw ?: @"",
-            @"hash": gLastBusinessHash ?: @""
-        };
+
+    if (filteredStack.count == 0) {
+        return @"<stack-filtered>";
     }
-    [businessTraceLock unlock];
-    return snapshot;
+    return [filteredStack componentsJoinedByString:@"\n"];
 }
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
-
-static void logBusinessRawTrace(NSString *rawString) {
-    if (rawString.length == 0) {
-        return;
-    }
-
-    NSString *hashString = sha256HexForString(rawString) ?: @"<hash-failed>";
-    storeLatestBusinessTrace(rawString, hashString);
-
-    long long hitCount = __sync_add_and_fetch(&gBusinessRawHitCount, 1);
-    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
-    NSString *logMessage = [NSString stringWithFormat:
-                            @"[QE Raw #%lld]\n"
-                            @"Source: sub_100C36D54\n"
-                            @"Meaning: business raw string -> Data -> CryptoKit.SHA256\n"
-                            @"Raw: %@\n"
-                            @"SHA256(Local): %@",
-                            hitCount,
-                            rawString,
-                            hashString];
-    appendLogMessage(logMessage, @"QEDataBridge", @"self-raw", rawHits);
-}
-
-static NSString *normalizedQiekjPath(NSURLRequest *request) {
-    NSString *absoluteURL = request.URL.absoluteString ?: @"";
-    NSString *path = absoluteURL;
-    NSString *prefix = @"https://userapi.qiekj.com/";
-    NSRange prefixRange = [absoluteURL rangeOfString:prefix options:NSCaseInsensitiveSearch];
-    if (prefixRange.location != NSNotFound) {
-        NSUInteger start = prefixRange.location + prefixRange.length;
-        if (start > 0) {
-            start -= 1;
-        }
-        path = [absoluteURL substringFromIndex:MIN(start, absoluteURL.length)];
-    } else {
-        path = request.URL.path ?: @"";
-    }
-
-    NSRange queryRange = [path rangeOfString:@"?"];
-    if (queryRange.location != NSNotFound) {
-        path = [path substringToIndex:queryRange.location];
-    }
-
-    if (path.length == 0) {
-        return nil;
-    }
-    if (![path hasPrefix:@"/"]) {
-        path = [@"/" stringByAppendingString:path];
-    }
-    return path;
-}
-
-static NSDictionary<NSString *, NSString *> *computedQiekjSignInfo(NSURLRequest *request) {
-    NSString *host = request.URL.host.lowercaseString ?: @"";
-    if (![host containsString:@"qiekj.com"]) {
-        return nil;
-    }
-
-    NSString *timestamp = headerValue(request, @"timestamp");
-    NSString *channel = headerValue(request, @"channel") ?: @"ios_app";
-    NSString *version = headerValue(request, @"version");
-    NSString *versionSource = @"HTTP header[version]";
-    if (version.length == 0) {
-        NSDictionary<NSString *, NSString *> *versionInfo = currentAppVersionInfo();
-        version = versionInfo[@"value"];
-        versionSource = versionInfo[@"source"];
-    }
-    NSDictionary<NSString *, NSString *> *tokenInfo = currentUserTokenInfo();
-    NSString *token = tokenInfo[@"value"];
-    NSString *tokenSource = tokenInfo[@"source"];
-    NSString *path = normalizedQiekjPath(request);
-    NSMutableDictionary<NSString *, NSString *> *info = [@{
-        @"algorithm": kQiekjSignAlgorithm,
-        @"entryChain": kQiekjSignEntryChain,
-        @"template": kQiekjSignTemplate,
-        @"secret": kQiekjSignSecret,
-        @"pathRule": kQiekjPathRule,
-        @"tokenSource": tokenSource ?: @"<unknown>",
-        @"versionSource": versionSource ?: @"<unknown>"
-    } mutableCopy];
-
-    if (timestamp.length > 0) info[@"timestamp"] = timestamp;
-    if (channel.length > 0) info[@"channel"] = channel;
-    if (version.length > 0) info[@"version"] = version;
-    if (token.length > 0) info[@"token"] = token;
-    if (path.length > 0) info[@"path"] = path;
-
-    if (timestamp.length == 0 || channel.length == 0 || version.length == 0 || token.length == 0 || path.length == 0) {
-        return info;
-    }
-
-    NSString *raw = [NSString stringWithFormat:kQiekjSignTemplate,
-                     kQiekjSignSecret,
-                     channel,
-                     timestamp,
-                     token,
-                     version,
-                     path];
-    NSString *sign = sha256HexForString(raw);
-    if (!sign) {
-        return nil;
-    }
-
-    info[@"raw"] = raw;
-    info[@"sign"] = sign;
-    return info;
-}
-
-static void logQiekjRuleSummaryIfNeeded(long long rawHits) {
-    if (gDidLogQiekjRuleSummary) {
-        return;
-    }
-    gDidLogQiekjRuleSummary = YES;
-
-    NSString *summary = [NSString stringWithFormat:
-                         @"[QE Sign Rule]\n"
-                         @"Source: IDA-MCP\n"
-                         @"Entry: %@\n"
-                         @"Hash: %@\n"
-                         @"Template: %@\n"
-                         @"Secret: %@\n"
-                         @"PathRule: %@\n"
-                         @"TokenSource: sub_1004BA88C -> KUserToken\n"
-                         @"VersionSource: sub_100079FB8 -> NSBundle.mainBundle -> CFBundleShortVersionString",
-                         kQiekjSignEntryChain,
-                         kQiekjSignAlgorithm,
-                         kQiekjSignTemplate,
-                         kQiekjSignSecret,
-                         kQiekjPathRule];
-    appendLogMessage(summary, @"IDA-MCP", @"qe-rule", rawHits);
-}
 
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits) {
     NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -613,91 +411,16 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
     }
 
     long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
-    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 0);
+    long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         SHAFloatingWindow *window = [SHAFloatingWindow shared];
         [window updateStatusWithRawHits:rawHits
                               shownHits:shownHits
-                            requestHits:requestHits
+                               utf8Hits:utf8Hits
                              lastSource:source
                                    note:note];
         [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath]];
     });
-}
-
-static void logInterestingRequest(NSURLRequest *request, NSString *source) {
-    if (!request) {
-        return;
-    }
-
-    NSString *host = request.URL.host.lowercaseString ?: @"";
-    NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
-    NSString *signValue = headers[@"sign"] ?: headers[@"Sign"] ?: headers[@"SIGN"];
-    BOOL interesting = (signValue.length > 0 || [host containsString:@"qiekj.com"]);
-    if (!interesting) {
-        return;
-    }
-
-    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 1);
-    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
-    logQiekjRuleSummaryIfNeeded(rawHits);
-
-    NSData *bodyData = request.HTTPBody;
-    NSString *bodyPreview = bodyData ? stringFromBytes(bodyData.bytes, bodyData.length) : @"<none>";
-    if (!bodyData && request.HTTPBodyStream) {
-        bodyPreview = @"<HTTPBodyStream>";
-    }
-
-    NSDictionary<NSString *, NSString *> *signInfo = computedQiekjSignInfo(request);
-    NSString *actualSign = signValue ?: @"<none>";
-    NSString *computedSign = signInfo[@"sign"];
-    NSString *note = @"request";
-    NSMutableString *extra = [NSMutableString string];
-    NSDictionary<NSString *, NSString *> *businessTrace = latestBusinessTrace();
-    [extra appendString:@"\nRuleSource: IDA-MCP"];
-    [extra appendFormat:@"\nEntryChain: %@", signInfo[@"entryChain"] ?: kQiekjSignEntryChain];
-    [extra appendFormat:@"\nHashAlgorithm: %@", signInfo[@"algorithm"] ?: kQiekjSignAlgorithm];
-    [extra appendFormat:@"\nTemplate: %@", signInfo[@"template"] ?: kQiekjSignTemplate];
-    [extra appendFormat:@"\nSecret: %@", signInfo[@"secret"] ?: kQiekjSignSecret];
-    [extra appendFormat:@"\nPathRule: %@", signInfo[@"pathRule"] ?: kQiekjPathRule];
-    [extra appendFormat:@"\nTokenSource: %@", signInfo[@"tokenSource"] ?: @"<unknown>"];
-    [extra appendFormat:@"\nVersionSource: %@", signInfo[@"versionSource"] ?: @"<unknown>"];
-    if (businessTrace[@"raw"]) {
-        [extra appendFormat:@"\nBusinessRawSeen: %@", businessTrace[@"raw"]];
-    }
-    if (businessTrace[@"hash"]) {
-        BOOL businessMatch = [businessTrace[@"hash"] caseInsensitiveCompare:actualSign] == NSOrderedSame;
-        [extra appendFormat:@"\nBusinessRawSHA256: %@", businessTrace[@"hash"]];
-        [extra appendFormat:@"\nBusinessRawMatch: %@", businessMatch ? @"YES" : @"NO"];
-    }
-    if (computedSign.length > 0) {
-        BOOL matched = [computedSign caseInsensitiveCompare:actualSign] == NSOrderedSame;
-        note = matched ? @"sign-ok" : @"sign-miss";
-        [extra appendFormat:@"\nComputedSign: %@", computedSign];
-        [extra appendFormat:@"\nSignMatch: %@", matched ? @"YES" : @"NO"];
-        [extra appendFormat:@"\nPath: %@", signInfo[@"path"] ?: @"<nil>"];
-        [extra appendFormat:@"\nTimestamp: %@", signInfo[@"timestamp"] ?: @"<nil>"];
-        [extra appendFormat:@"\nVersion: %@", signInfo[@"version"] ?: @"<nil>"];
-        [extra appendFormat:@"\nToken: %@", signInfo[@"token"] ?: @"<nil>"];
-        [extra appendFormat:@"\nRaw: %@", signInfo[@"raw"] ?: @"<nil>"];
-    } else if (signInfo.count > 0) {
-        note = @"need-token";
-        [extra appendFormat:@"\nPartialInfo: %@", signInfo];
-    }
-
-    NSString *logMessage = [NSString stringWithFormat:@"[Request %@ #%lld]\n%@ %@\nHost: %@\nHeaders: %@\nBody: %@\nActualSign: %@%@",
-                            source,
-                            requestHits,
-                            request.HTTPMethod ?: @"GET",
-                            request.URL.absoluteString ?: @"<nil-url>",
-                            host.length > 0 ? host : @"<nil-host>",
-                            headers,
-                            bodyPreview,
-                            actualSign,
-                            extra];
-
-    NSLog(@"[SHA256_HOOK_REQUEST]\n%@", logMessage);
-    appendLogMessage(logMessage, source, note, rawHits);
 }
 
 static void process_sha256(const void *data, size_t len, unsigned char *digest, NSString *source) {
@@ -706,19 +429,23 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     }
 
     long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 1);
-    long long requestHits = __sync_add_and_fetch(&gRequestHitCount, 0);
-    NSString *inputString = stringFromBytes(data, len);
-    BOOL keywordMatch = ([inputString containsString:@"appSecret="] ||
-                         [inputString containsString:@"qiekj.com"]);
-    BOOL debugSample = (rawHits <= 12);
-    BOOL passesDisplayFilter = keywordMatch || debugSample;
+    NSString *utf8String = utf8StringFromBytes(data, len);
+    BOOL hasUTF8Text = (utf8String.length > 0);
+    if (hasUTF8Text) {
+        __sync_add_and_fetch(&gUTF8HitCount, 1);
+    }
+
+    BOOL debugBinarySample = (!hasUTF8Text && rawHits <= 8);
+    BOOL passesDisplayFilter = hasUTF8Text || debugBinarySample;
+    NSString *resolvedSource = resolvedSourceName(source);
     long long shownHitsSnapshot = __sync_add_and_fetch(&gShownHookHitCount, 0);
+    long long utf8HitsSnapshot = __sync_add_and_fetch(&gUTF8HitCount, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         [[SHAFloatingWindow shared] updateStatusWithRawHits:rawHits
                                                   shownHits:shownHitsSnapshot
-                                                requestHits:requestHits
-                                                 lastSource:source
-                                                       note:(keywordMatch ? @"matched" : (debugSample ? @"sample" : @"filtered"))];
+                                                   utf8Hits:utf8HitsSnapshot
+                                                 lastSource:resolvedSource
+                                                       note:(hasUTF8Text ? @"utf8" : (debugBinarySample ? @"binary-sample" : @"binary-filtered"))];
     });
 
     if (!passesDisplayFilter) {
@@ -727,31 +454,33 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
 
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown.bundle";
     NSTimeInterval timestamp = [[NSDate date] timeIntervalSince1970];
-
-    NSArray *stack = [NSThread callStackSymbols];
-    NSMutableArray *filteredStack = [NSMutableArray array];
-    for (NSString *line in stack) {
-        if ([line containsString:@"libsystem"] ||
-            [line containsString:@"libdispatch"] ||
-            [line containsString:@"corecrypto"] ||
-            [line containsString:@"CydiaSubstrate"] ||
-            [line containsString:@"CryptoKit"] ||
-            [line containsString:@"Tweak"]) {
-            continue;
-        }
-        [filteredStack addObject:line];
-    }
-
-    NSString *logMessage = [NSString stringWithFormat:@"[%@]\nTime: %.3f\nBundle: %@\nInput: %@\nHash: %@\nStack:\n%@",
-                            source,
+    NSString *hexPreview = hexPreviewFromBytes(data, len, 96);
+    NSString *logMessage = [NSString stringWithFormat:
+                            @"[SHA256 #%lld]\n"
+                            @"Source: %@\n"
+                            @"Algorithm: SHA-256\n"
+                            @"Meaning: runtime final SHA256 input\n"
+                            @"Time: %.3f\n"
+                            @"Bundle: %@\n"
+                            @"InputLength: %zu\n"
+                            @"InputType: %@\n"
+                            @"Plaintext: %@\n"
+                            @"HexPreview: %@\n"
+                            @"Hash: %@\n"
+                            @"Stack:\n%@",
+                            rawHits,
+                            resolvedSource,
                             timestamp,
                             bundleId,
-                            inputString,
+                            len,
+                            hasUTF8Text ? @"UTF-8 text" : @"binary-preview",
+                            hasUTF8Text ? utf8String : @"<non-utf8>",
+                            hexPreview,
                             digestHexString(digest, 32),
-                            [filteredStack componentsJoinedByString:@"\n"]];
+                            filteredStackTrace()];
 
     NSLog(@"[SHA256_HOOK]\n%@", logMessage);
-    appendLogMessage(logMessage, source, (keywordMatch ? @"shown" : @"sample"), rawHits);
+    appendLogMessage(logMessage, resolvedSource, (hasUTF8Text ? @"utf8" : @"binary-sample"), rawHits);
 }
 
 struct ccdigest_info {
@@ -869,54 +598,17 @@ static int my_CC_SHA256_Final(unsigned char *md, CC_SHA256_CTX *c) {
 
 static void (*orig_cryptokit_sha256)(void *a, void *b, void *c);
 static void my_cryptokit_sha256(void *a, void *b, void *c) {
-    NSLog(@"[SHA256_HOOK] Hit Swift CryptoKit.SHA256 wrapper");
-    orig_cryptokit_sha256(a, b, c);
-}
-
-static SwiftPair my_qe_string_to_data(SwiftPair rawValue) {
-    NSString *rawString = stringFromSwiftString(rawValue);
-    SwiftPair ret = orig_qe_string_to_data(rawValue);
-
-    BOOL interesting = (rawString.length > 0 &&
-                        ([rawString containsString:@"appSecret="] ||
-                         [rawString containsString:@"channel="] ||
-                         [rawString containsString:@"timestamp="]));
-    if (interesting) {
-        logBusinessRawTrace(rawString);
+    NSString *previousHint = setThreadSourceHint(@"CryptoKit.SHA256");
+    @try {
+        orig_cryptokit_sha256(a, b, c);
+    } @finally {
+        restoreThreadSourceHint(previousHint);
     }
-    return ret;
 }
-
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    logInterestingRequest(request, @"NSURLSession");
-    return %orig;
-}
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
-    logInterestingRequest(request, @"NSURLSession");
-    return %orig;
-}
-
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
-                                         fromData:(NSData *)bodyData
-                                completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
-    NSMutableURLRequest *mutableRequest = [request mutableCopy];
-    if (bodyData.length > 0 && !mutableRequest.HTTPBody) {
-        mutableRequest.HTTPBody = bodyData;
-    }
-    logInterestingRequest(mutableRequest ?: request, @"NSURLUpload");
-    return %orig;
-}
-
-%end
 
 %ctor {
     incrementalBuffers = [NSMutableDictionary dictionary];
     incrementalLock = [[NSLock alloc] init];
-    businessTraceLock = [[NSLock alloc] init];
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification
@@ -976,32 +668,24 @@ static SwiftPair my_qe_string_to_data(SwiftPair rawValue) {
         void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
         if (swiftHashSym) {
             MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
+            gDidInstallCryptoKitWrapper = YES;
         }
-    }
-
-    MSImageRef swiftFoundationRef = MSGetImageByName("/usr/lib/swift/libswiftFoundation.dylib");
-    if (swiftFoundationRef) {
-        gSwiftStringToNSString = (SwiftStringToNSStringFunc)MSFindSymbol(swiftFoundationRef, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
-    }
-
-    if (gSwiftStringToNSString) {
-        intptr_t slide = _dyld_get_image_vmaddr_slide(0);
-        uintptr_t qeStringToDataAddr = (uintptr_t)((intptr_t)kQEStringToDataEA + slide);
-        MSHookFunction((void *)qeStringToDataAddr, (void *)my_qe_string_to_data, (void **)&orig_qe_string_to_data);
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
         long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
-        if (gSwiftStringToNSString && orig_qe_string_to_data) {
-            appendLogMessage(@"[QE Runtime Hook]\nSource: sub_100C36D54\nStatus: installed\nMeaning: capture real raw string before CryptoKit.SHA256",
-                             @"QEDataBridge",
-                             @"installed",
-                             rawHits);
-        } else if (!gSwiftStringToNSString) {
-            appendLogMessage(@"[QE Runtime Hook]\nSource: libswiftFoundation\nStatus: missing String->NSString bridge symbol",
-                             @"QEDataBridge",
-                             @"bridge-missing",
-                             rawHits);
-        }
+        NSString *startupMessage = [NSString stringWithFormat:
+                                    @"[Generic SHA256 Hook]\n"
+                                    @"Status: installed\n"
+                                    @"Meaning: capture runtime SHA256 input without business-specific symbols\n"
+                                    @"OneShot: CC_SHA256\n"
+                                    @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
+                                    @"CryptoKitWrapper: %@\n"
+                                    @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
+                                    gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
+        appendLogMessage(startupMessage,
+                         @"Runtime",
+                         @"installed",
+                         rawHits);
     });
 }

@@ -1,12 +1,15 @@
-name: Build Tweak for TrollFools
+name: Build and Release Theos Package
 
 on:
   push:
     branches:
       - main
-      - cryptokitsha256hook
-  pull_request:
+    tags:
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   THEOS: ${{ github.workspace }}/theos
@@ -15,26 +18,52 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Build Dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git xz-utils libxml2 libtinfo6
 
-      - name: Set up Theos Toolchain and SDK
+      - name: Set up Theos and SDK
         run: |
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
           mkdir -p "$THEOS/toolchain"
           curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ -C "$THEOS/toolchain"
           "$THEOS/bin/install-sdk" latest
 
-      - name: Build deb Package
-        run: make package FINALPACKAGE=1
+      - name: Build package
+        run: |
+          make clean package FINALPACKAGE=1
+          mkdir -p dist
+          cp packages/*.deb dist/
 
-      - name: Upload Artifact
+      - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CryptoKitSHA256Hook-deb
-          path: packages/*.deb
+          name: CryptoKitSHA256Hook-package
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CryptoKitSHA256Hook-package
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CryptoKitSHA256Hook ${{ github.ref_name }}
+          files: dist/*.deb
+          generate_release_notes: true
+          overwrite_files: true
