@@ -50,6 +50,16 @@
 + (instancetype)shared {
     static SHAFloatingWindow *win = nil;
     static dispatch_once_t onceToken;
+
+    // A UIWindow that belongs to no UIWindowScene has garbage bounds on iOS 16;
+    // reading self.bounds during layout faults with "Address size fault".
+    // Only materialise the window once a real scene exists.
+    if (@available(iOS 13.0, *)) {
+        if (![self bestScene]) {
+            return nil;
+        }
+    }
+
     dispatch_once(&onceToken, ^{
         UIWindowScene *scene = [self bestScene];
         if (@available(iOS 13.0, *)) {
@@ -67,27 +77,30 @@
     return win;
 }
 
-// Avoid touching UIScreen.mainScreen while the window has no scene attached;
-// on iOS 16 that path can fault during very early layout. Fall back to the
-// scene's own coordinate space, then to a conservative fixed size.
 - (CGRect)screenBoundsSafely {
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = [SHAFloatingWindow bestScene];
+        UIWindowScene *scene = self.windowScene;
         if (scene) {
             return scene.coordinateSpace.bounds;
         }
     }
-    UIScreen *screen = [UIScreen mainScreen];
-    if (screen) {
+    UIScreen *screen = self.screen ?: [UIScreen mainScreen];
+    if (screen && !CGRectIsEmpty(screen.bounds)) {
         return screen.bounds;
     }
     return CGRectMake(0.0, 0.0, 390.0, 844.0);
 }
 
 - (CGRect)defaultPanelFrame {
-    CGFloat availableWidth = MAX(220.0, CGRectGetWidth(self.bounds) - 24.0);
+    // Never read self.bounds directly: a scene-less UIWindow on iOS 16 has
+    // garbage bounds and faults on access. Go through screenBoundsSafely.
+    CGRect bounds = [self screenBoundsSafely];
+    if (CGRectIsEmpty(bounds)) {
+        bounds = CGRectMake(0.0, 0.0, 390.0, 844.0);
+    }
+    CGFloat availableWidth = MAX(220.0, CGRectGetWidth(bounds) - 24.0);
     CGFloat panelWidth = MIN(340.0, availableWidth);
-    CGFloat panelHeight = MIN(300.0, MAX(190.0, CGRectGetHeight(self.bounds) - 180.0));
+    CGFloat panelHeight = MIN(300.0, MAX(190.0, CGRectGetHeight(bounds) - 180.0));
     return CGRectMake(12.0, 90.0, panelWidth, panelHeight);
 }
 
@@ -176,7 +189,12 @@
 - (void)attachToBestSceneIfNeeded {
     if (@available(iOS 13.0, *)) {
         UIWindowScene *scene = [SHAFloatingWindow bestScene];
-        if (scene && self.windowScene != scene) {
+        if (!scene) {
+            // No scene yet; the window would have garbage bounds. Bail out and
+            // let the next scene notification retry us.
+            return;
+        }
+        if (self.windowScene != scene) {
             self.windowScene = scene;
         }
     }
@@ -194,9 +212,15 @@
     // with an inconsistent state (observed as SIGBUS / Address size fault
     // inside the window's own layout code on iOS 16). The window frame is
     // established in -commonInit / -attachToBestSceneIfNeeded instead.
-    if (self.rootViewController.view.frame.size.width != self.bounds.size.width ||
-        self.rootViewController.view.frame.size.height != self.bounds.size.height) {
-        self.rootViewController.view.frame = self.bounds;
+    if (!self.windowScene) {
+        return;
+    }
+    CGRect bounds = self.bounds;
+    if (CGRectIsEmpty(bounds)) {
+        return;
+    }
+    if (!CGRectEqualToRect(self.rootViewController.view.frame, bounds)) {
+        self.rootViewController.view.frame = bounds;
     }
 
     if (CGRectEqualToRect(self.panelView.frame, CGRectZero)) {
@@ -220,10 +244,12 @@
 
     self.textView.hidden = self.collapsed;
     if (!self.collapsed) {
+        CGFloat tvWidth = MAX(100.0, CGRectGetWidth(self.panelView.bounds) - 16.0);
+        CGFloat tvHeight = MAX(40.0, CGRectGetHeight(self.panelView.bounds) - CGRectGetMaxY(self.headerView.frame) - 8.0);
         self.textView.frame = CGRectMake(8.0,
                                          CGRectGetMaxY(self.headerView.frame),
-                                         width - 16.0,
-                                         CGRectGetHeight(self.panelView.bounds) - CGRectGetMaxY(self.headerView.frame) - 8.0);
+                                         tvWidth,
+                                         tvHeight);
     }
 }
 
@@ -612,22 +638,25 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
         popBridgeSuppression();
     }
 
-    long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
-    long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        pushBridgeSuppression();
-        @try {
-            SHAFloatingWindow *window = [SHAFloatingWindow shared];
-            [window updateStatusWithRawHits:rawHits
-                                  shownHits:shownHits
-                                   utf8Hits:utf8Hits
-                                 lastSource:source
-                                       note:note];
-            [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath ?: @"<unknown>"]];
-        } @finally {
-            popBridgeSuppression();
-        }
-    });
+        long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
+        long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            pushBridgeSuppression();
+            @try {
+                SHAFloatingWindow *window = [SHAFloatingWindow shared];
+                if (!window) {
+                    return;
+                }
+                [window updateStatusWithRawHits:rawHits
+                                      shownHits:shownHits
+                                       utf8Hits:utf8Hits
+                                     lastSource:source
+                                           note:note];
+                [window addLog:[logMessage stringByAppendingFormat:@"\n\n[Saved]\n%@", logFilePath ?: @"<unknown>"]];
+            } @finally {
+                popBridgeSuppression();
+            }
+        });
 }
 
 static void process_sha256(const void *data, size_t len, unsigned char *digest, NSString *source) {
@@ -650,15 +679,24 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
     BOOL debugBinarySample = (!hasUTF8Text && rawHits <= 8);
     BOOL passesDisplayFilter = hasUTF8Text || debugBinarySample || (bridgeCandidate != nil);
     NSString *resolvedSource = resolvedSourceName(source);
-    long long shownHitsSnapshot = __sync_add_and_fetch(&gShownHookHitCount, 0);
-    long long utf8HitsSnapshot = __sync_add_and_fetch(&gUTF8HitCount, 0);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[SHAFloatingWindow shared] updateStatusWithRawHits:rawHits
-                                                  shownHits:shownHitsSnapshot
-                                                   utf8Hits:utf8HitsSnapshot
-                                                 lastSource:resolvedSource
-                                                       note:(hasUTF8Text ? @"utf8" : (bridgeCandidate ? @"utf8-bridge" : (debugBinarySample ? @"binary-sample" : @"binary-filtered")))];
-    });
+        long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
+        long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SHAFloatingWindow *window = [SHAFloatingWindow shared];
+            if (!window) {
+                return;
+            }
+            pushBridgeSuppression();
+            @try {
+                [window updateStatusWithRawHits:rawHits
+                                      shownHits:shownHits
+                                       utf8Hits:utf8Hits
+                                     lastSource:resolvedSource
+                                           note:(hasUTF8Text ? @"utf8" : (bridgeCandidate ? @"utf8-bridge" : (debugBinarySample ? @"binary-sample" : @"binary-filtered")))];
+            } @finally {
+                popBridgeSuppression();
+            }
+        });
 
     if (!passesDisplayFilter) {
         return;
@@ -911,6 +949,8 @@ static void installHooks(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *note) {
+        // shared returns nil until a UIWindowScene exists; scene observers
+        // below pick it up as soon as one connects.
         [SHAFloatingWindow shared];
     }];
     [center addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -921,6 +961,12 @@ static void installHooks(void) {
     }];
 
     if (@available(iOS 13.0, *)) {
+        [center addObserverForName:UISceneDidConnectNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(__unused NSNotification *note) {
+            [SHAFloatingWindow shared];
+        }];
         [center addObserverForName:UISceneDidActivateNotification
                             object:nil
                              queue:[NSOperationQueue mainQueue]
