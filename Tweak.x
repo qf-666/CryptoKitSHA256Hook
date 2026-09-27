@@ -13,7 +13,6 @@
 
 
 static long long gRawHookHitCount = 0;
-static long long gShownHookHitCount = 0;
 static long long gUTF8HitCount = 0;
 
 static NSMutableDictionary *incrementalBuffers;
