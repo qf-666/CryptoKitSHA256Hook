@@ -3,7 +3,13 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import "fishhook.h"
 
-@interface SHAFloatingWindow : UIWindow
+// ---------------------------------------------------------------- overlay ---
+// Deliberately NOT a UIWindow subclass. Creating our own UIWindow on iOS 16
+// while the host app's scene is still settling produced repeated SIGBUS
+// ("Address size fault") inside our own layout code, because a window that is
+// not attached to a live UIWindowScene has undefined bounds. Instead we hang a
+// plain UIView off whatever window the host app already owns and is displaying.
+@interface SHAOverlayView : UIView
 @property (nonatomic, strong) UIView *panelView;
 @property (nonatomic, strong) UIView *headerView;
 @property (nonatomic, strong) UILabel *titleLabel;
@@ -24,77 +30,74 @@
                            note:(NSString *)note;
 @end
 
-@implementation SHAFloatingWindow
+@implementation SHAOverlayView
 
-+ (UIWindowScene *)bestScene {
+// Find a window that actually exists and is on screen. Returns nil when the
+// host app has not finished building its UI yet; callers must tolerate that and
+// retry later.
++ (UIWindow *)hostWindow {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) {
+        return nil;
+    }
+
+    UIWindow *fallback = app.delegate.window;
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *fallbackScene = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        for (UIScene *scene in app.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) {
                 continue;
             }
             UIWindowScene *windowScene = (UIWindowScene *)scene;
-            if (!fallbackScene) {
-                fallbackScene = windowScene;
+            if (scene.activationState != UISceneActivationStateForegroundActive &&
+                scene.activationState != UISceneActivationStateForegroundInactive) {
+                continue;
             }
-            if (scene.activationState == UISceneActivationStateForegroundActive ||
-                scene.activationState == UISceneActivationStateForegroundInactive) {
-                return windowScene;
+            for (UIWindow *w in windowScene.windows) {
+                if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) {
+                    return w;
+                }
+            }
+            for (UIWindow *w in windowScene.windows) {
+                if (w.windowLevel == UIWindowLevelNormal) {
+                    return w;
+                }
             }
         }
-        return fallbackScene;
+    }
+    if (fallback && fallback.windowLevel == UIWindowLevelNormal) {
+        return fallback;
     }
     return nil;
 }
 
 + (instancetype)shared {
-    static SHAFloatingWindow *win = nil;
+    static SHAOverlayView *view = nil;
     static dispatch_once_t onceToken;
 
-    // A UIWindow that belongs to no UIWindowScene has garbage bounds on iOS 16;
-    // reading self.bounds during layout faults with "Address size fault".
-    // Only materialise the window once a real scene exists.
-    if (@available(iOS 13.0, *)) {
-        if (![self bestScene]) {
-            return nil;
-        }
+    UIWindow *host = [self hostWindow];
+    if (!host) {
+        return nil;
     }
 
     dispatch_once(&onceToken, ^{
-        UIWindowScene *scene = [self bestScene];
-        if (@available(iOS 13.0, *)) {
-            if (scene) {
-                win = [[self alloc] initWithWindowScene:scene];
-            } else {
-                win = [[self alloc] init];
-            }
-        } else {
-            win = [[self alloc] init];
-        }
-        [win commonInit];
+        view = [[self alloc] initWithFrame:host.bounds];
+        [view commonInit];
     });
-    [win attachToBestSceneIfNeeded];
-    return win;
-}
 
-- (CGRect)screenBoundsSafely {
-    if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = self.windowScene;
-        if (scene) {
-            return scene.coordinateSpace.bounds;
-        }
+    // Re-attach if the host window changed (rotation, app switch, scene swap).
+    if (view.superview != host) {
+        [view removeFromSuperview];
+        view.frame = host.bounds;
+        [host addSubview:view];
+    } else if (!CGRectEqualToRect(view.frame, host.bounds)) {
+        view.frame = host.bounds;
     }
-    UIScreen *screen = self.screen ?: [UIScreen mainScreen];
-    if (screen && !CGRectIsEmpty(screen.bounds)) {
-        return screen.bounds;
-    }
-    return CGRectMake(0.0, 0.0, 390.0, 844.0);
+    [view setNeedsLayout];
+    return view;
 }
 
 - (CGRect)defaultPanelFrame {
-    // Never read self.bounds directly: a scene-less UIWindow on iOS 16 has
-    // garbage bounds and faults on access. Go through screenBoundsSafely.
-    CGRect bounds = [self screenBoundsSafely];
+    CGRect bounds = self.bounds;
     if (CGRectIsEmpty(bounds)) {
         bounds = CGRectMake(0.0, 0.0, 390.0, 844.0);
     }
@@ -105,15 +108,10 @@
 }
 
 - (void)commonInit {
-    self.frame = [self screenBoundsSafely];
-    self.windowLevel = UIWindowLevelAlert + 1000;
     self.backgroundColor = [UIColor clearColor];
     self.userInteractionEnabled = YES;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.expandedHeight = CGRectGetHeight([self defaultPanelFrame]);
-
-    UIViewController *rootVC = [[UIViewController alloc] init];
-    rootVC.view.backgroundColor = [UIColor clearColor];
-    self.rootViewController = rootVC;
 
     self.panelView = [[UIView alloc] initWithFrame:[self defaultPanelFrame]];
     self.panelView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
@@ -121,6 +119,8 @@
     self.panelView.layer.borderWidth = 1.0;
     self.panelView.layer.borderColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.4].CGColor;
     self.panelView.clipsToBounds = YES;
+    self.panelView.autoresizingMask = UIViewAutoresizingNone;
+    [self addSubview:self.panelView];
 
     self.headerView = [[UIView alloc] initWithFrame:CGRectZero];
     self.headerView.backgroundColor = [[UIColor colorWithRed:0.09 green:0.12 blue:0.10 alpha:0.95] colorWithAlphaComponent:0.95];
@@ -179,48 +179,15 @@
     self.textView.textContainerInset = UIEdgeInsetsMake(6, 4, 8, 4);
     [self.panelView addSubview:self.textView];
 
-    [self.rootViewController.view addSubview:self.panelView];
     [self updateStatusWithRawHits:0 shownHits:0 utf8Hits:0 lastSource:@"Loaded" note:@"ready"];
-
-    self.hidden = NO;
-    [self setNeedsLayout];
-}
-
-- (void)attachToBestSceneIfNeeded {
-    if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = [SHAFloatingWindow bestScene];
-        if (!scene) {
-            // No scene yet; the window would have garbage bounds. Bail out and
-            // let the next scene notification retry us.
-            return;
-        }
-        if (self.windowScene != scene) {
-            self.windowScene = scene;
-        }
-    }
-    self.frame = [self screenBoundsSafely];
-    self.hidden = NO;
     [self setNeedsLayout];
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
 
-    // NOTE: do NOT assign self.frame here. Mutating a UIWindow's frame from
-    // inside -layoutSubviews re-enters the layout pass and, when the window's
-    // scene is not fully attached yet, walks into UIScreen/UIScene internals
-    // with an inconsistent state (observed as SIGBUS / Address size fault
-    // inside the window's own layout code on iOS 16). The window frame is
-    // established in -commonInit / -attachToBestSceneIfNeeded instead.
-    if (!self.windowScene) {
+    if (CGRectIsEmpty(self.bounds)) {
         return;
-    }
-    CGRect bounds = self.bounds;
-    if (CGRectIsEmpty(bounds)) {
-        return;
-    }
-    if (!CGRectEqualToRect(self.rootViewController.view.frame, bounds)) {
-        self.rootViewController.view.frame = bounds;
     }
 
     if (CGRectEqualToRect(self.panelView.frame, CGRectZero)) {
@@ -236,8 +203,8 @@
 
     CGFloat width = CGRectGetWidth(self.panelView.bounds);
     self.headerView.frame = CGRectMake(0.0, 0.0, width, 66.0);
-    self.titleLabel.frame = CGRectMake(12.0, 10.0, width - 164.0, 18.0);
-    self.statusLabel.frame = CGRectMake(12.0, 29.0, width - 164.0, 28.0);
+    self.titleLabel.frame = CGRectMake(12.0, 10.0, MAX(20.0, width - 164.0), 18.0);
+    self.statusLabel.frame = CGRectMake(12.0, 29.0, MAX(20.0, width - 164.0), 28.0);
     self.collapseButton.frame = CGRectMake(width - 138.0, 14.0, 36.0, 36.0);
     self.clipboardButton.frame = CGRectMake(width - 96.0, 14.0, 42.0, 36.0);
     self.clearButton.frame = CGRectMake(width - 48.0, 14.0, 42.0, 36.0);
@@ -246,10 +213,7 @@
     if (!self.collapsed) {
         CGFloat tvWidth = MAX(100.0, CGRectGetWidth(self.panelView.bounds) - 16.0);
         CGFloat tvHeight = MAX(40.0, CGRectGetHeight(self.panelView.bounds) - CGRectGetMaxY(self.headerView.frame) - 8.0);
-        self.textView.frame = CGRectMake(8.0,
-                                         CGRectGetMaxY(self.headerView.frame),
-                                         tvWidth,
-                                         tvHeight);
+        self.textView.frame = CGRectMake(8.0, CGRectGetMaxY(self.headerView.frame), tvWidth, tvHeight);
     }
 }
 
@@ -265,7 +229,7 @@
 }
 
 - (void)handlePanelPan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.rootViewController.view];
+    CGPoint translation = [gesture translationInView:self];
     if (gesture.state == UIGestureRecognizerStateBegan) {
         self.dragStartOrigin = self.panelView.frame.origin;
     }
@@ -333,7 +297,12 @@
                              note ?: @"-"];
 }
 
+// Only the panel area should swallow touches; everywhere else stays pass-through
+// for the host app.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || self.alpha < 0.01) {
+        return nil;
+    }
     CGPoint pointInPanel = [self convertPoint:point toView:self.panelView];
     if (!CGRectContainsPoint(self.panelView.bounds, pointInPanel)) {
         return nil;
@@ -342,6 +311,7 @@
 }
 
 @end
+
 
 static long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
@@ -643,7 +613,7 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
         dispatch_async(dispatch_get_main_queue(), ^{
             pushBridgeSuppression();
             @try {
-                SHAFloatingWindow *window = [SHAFloatingWindow shared];
+                SHAOverlayView *window = [SHAOverlayView shared];
                 if (!window) {
                     return;
                 }
@@ -682,7 +652,7 @@ static void process_sha256(const void *data, size_t len, unsigned char *digest, 
         long long shownHits = __sync_add_and_fetch(&gShownHookHitCount, 1);
         long long utf8Hits = __sync_add_and_fetch(&gUTF8HitCount, 0);
         dispatch_async(dispatch_get_main_queue(), ^{
-            SHAFloatingWindow *window = [SHAFloatingWindow shared];
+            SHAOverlayView *window = [SHAOverlayView shared];
             if (!window) {
                 return;
             }
@@ -944,50 +914,49 @@ static void installHooks(void) {
     incrementalBuffers = [NSMutableDictionary dictionary];
     incrementalLock = [[NSLock alloc] init];
 
+    // The overlay attaches to the host app's own window, so it only becomes
+    // available once that window exists. Try on every plausible lifecycle
+    // event; SHAOverlayView.shared is a no-op until a host window is found.
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *note) {
-        // shared returns nil until a UIWindowScene exists; scene observers
-        // below pick it up as soon as one connects.
-        [SHAFloatingWindow shared];
+        [SHAOverlayView shared];
     }];
     [center addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *note) {
-        [SHAFloatingWindow shared];
+        [SHAOverlayView shared];
     }];
 
     if (@available(iOS 13.0, *)) {
-        // UISceneDidConnectNotification symbol is unavailable at the SDK link
-        // level we target; the constant is "UISceneDidConnectNotification".
         [center addObserverForName:@"UISceneDidConnectNotification"
                             object:nil
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(__unused NSNotification *note) {
-            [SHAFloatingWindow shared];
+            [SHAOverlayView shared];
         }];
         [center addObserverForName:UISceneDidActivateNotification
                             object:nil
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(__unused NSNotification *note) {
-            [SHAFloatingWindow shared];
+            [SHAOverlayView shared];
         }];
         [center addObserverForName:UISceneWillEnterForegroundNotification
                             object:nil
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(__unused NSNotification *note) {
-            [SHAFloatingWindow shared];
+            [SHAOverlayView shared];
         }];
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        [SHAFloatingWindow shared];
+        [SHAOverlayView shared];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            [SHAFloatingWindow shared];
+            [SHAOverlayView shared];
         });
     });
 
