@@ -831,6 +831,49 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
 
 %end
 
+static void installHooks(void) {
+    struct rebinding corecryptoBindings[] = {
+        {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
+        {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
+        {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
+        {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final},
+    };
+    rebind_symbols(corecryptoBindings, sizeof(corecryptoBindings) / sizeof(corecryptoBindings[0]));
+
+    struct rebinding commonCryptoBindings[] = {
+        {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
+        {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
+        {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
+        {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final},
+    };
+    rebind_symbols(commonCryptoBindings, sizeof(commonCryptoBindings) / sizeof(commonCryptoBindings[0]));
+
+    MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
+    if (cryptoKitRef) {
+        void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
+        if (swiftHashSym) {
+            MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
+            gDidInstallCryptoKitWrapper = YES;
+        }
+    }
+
+    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+    NSString *startupMessage = [NSString stringWithFormat:
+                                @"[Generic SHA256 Hook]\n"
+                                @"Status: installed\n"
+                                @"Meaning: capture runtime SHA256 input without business-specific symbols\n"
+                                @"OneShot: CC_SHA256\n"
+                                @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
+                                @"CryptoKitWrapper: %@\n"
+                                @"UTF8Bridge: deferred correlate on SHA hit\n"
+                                @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
+                                gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
+    appendLogMessage(startupMessage,
+                     @"Runtime",
+                     @"installed",
+                     rawHits);
+}
+
 %ctor {
     incrementalBuffers = [NSMutableDictionary dictionary];
     incrementalLock = [[NSLock alloc] init];
@@ -872,46 +915,12 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
         });
     });
 
-    struct rebinding corecryptoBindings[] = {
-        {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
-        {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
-        {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
-        {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final},
-    };
-    rebind_symbols(corecryptoBindings, sizeof(corecryptoBindings) / sizeof(corecryptoBindings[0]));
-
-    struct rebinding commonCryptoBindings[] = {
-        {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
-        {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
-        {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
-        {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final},
-    };
-    rebind_symbols(commonCryptoBindings, sizeof(commonCryptoBindings) / sizeof(commonCryptoBindings[0]));
-
-    MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
-    if (cryptoKitRef) {
-        void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
-        if (swiftHashSym) {
-            MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
-            gDidInstallCryptoKitWrapper = YES;
-        }
-    }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
-        NSString *startupMessage = [NSString stringWithFormat:
-                                    @"[Generic SHA256 Hook]\n"
-                                    @"Status: installed\n"
-                                    @"Meaning: capture runtime SHA256 input without business-specific symbols\n"
-                                    @"OneShot: CC_SHA256\n"
-                                    @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
-                                    @"CryptoKitWrapper: %@\n"
-                                    @"UTF8Bridge: deferred correlate on SHA hit\n"
-                                    @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
-                                    gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
-        appendLogMessage(startupMessage,
-                         @"Runtime",
-                         @"installed",
-                         rawHits);
+    // rebind_symbols writes to __DATA_CONST (lazy/non-lazy pointer tables).
+    // During dyld initializer execution that segment may already be demoted to
+    // read-only, causing SIGBUS on launch. Defer all symbol patching to the
+    // main thread after the app finished loading.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        installHooks();
     });
 }
