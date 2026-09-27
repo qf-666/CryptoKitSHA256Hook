@@ -191,6 +191,21 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
 
 static void _rebind_symbols_for_image(const struct mach_header *header,
                                       intptr_t slide) {
+    // Do not touch the host app's own binary. Its __DATA_CONST pages are
+    // already demoted to read-only by the time we run, and mprotect-ing them
+    // back to writable corrupts the COW state: the next lazy-symbol stub call
+    // from inside that image faults with SIGBUS / "Address size fault".
+    // CoreCrypto / CommonCrypto (where ccdigest and CC_SHA256 actually live)
+    // live in dylibs, so skipping the main executable loses nothing.
+    Dl_info info;
+    if (dladdr(header, &info) != 0 && info.dli_fname) {
+        const char *path = info.dli_fname;
+        const char *base = strrchr(path, '/');
+        const char *fname = base ? base + 1 : path;
+        if (strstr(path, ".app/") && !strstr(fname, ".dylib")) {
+            return;
+        }
+    }
     rebind_symbols_for_image(_rebindings_head, header, slide);
 }
 
@@ -214,7 +229,13 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
     return retval;
   }
   if (!_rebindings_head->next) {
-    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+    // Registering an add-image callback means every image loaded later gets
+    // rebound too - including ones whose __DATA_CONST is already locked. That
+    // is what caused the SIGBUS chain. Bind only against images loaded so far.
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+      _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    }
   } else {
     uint32_t c = _dyld_image_count();
     for (uint32_t i = 0; i < c; i++) {
