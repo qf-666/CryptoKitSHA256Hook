@@ -961,7 +961,9 @@ static void installHooks(void) {
     }];
 
     if (@available(iOS 13.0, *)) {
-        [center addObserverForName:UISceneDidConnectNotification
+        // UISceneDidConnectNotification symbol is unavailable at the SDK link
+        // level we target; the constant is "UISceneDidConnectNotification".
+        [center addObserverForName:@"UISceneDidConnectNotification"
                             object:nil
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(__unused NSNotification *note) {
