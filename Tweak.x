@@ -56,15 +56,32 @@
             if (scene) {
                 win = [[self alloc] initWithWindowScene:scene];
             } else {
-                win = [[self alloc] initWithFrame:[UIScreen mainScreen].bounds];
+                win = [[self alloc] init];
             }
         } else {
-            win = [[self alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            win = [[self alloc] init];
         }
         [win commonInit];
     });
     [win attachToBestSceneIfNeeded];
     return win;
+}
+
+// Avoid touching UIScreen.mainScreen while the window has no scene attached;
+// on iOS 16 that path can fault during very early layout. Fall back to the
+// scene's own coordinate space, then to a conservative fixed size.
+- (CGRect)screenBoundsSafely {
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = [SHAFloatingWindow bestScene];
+        if (scene) {
+            return scene.coordinateSpace.bounds;
+        }
+    }
+    UIScreen *screen = [UIScreen mainScreen];
+    if (screen) {
+        return screen.bounds;
+    }
+    return CGRectMake(0.0, 0.0, 390.0, 844.0);
 }
 
 - (CGRect)defaultPanelFrame {
@@ -75,7 +92,7 @@
 }
 
 - (void)commonInit {
-    self.frame = [UIScreen mainScreen].bounds;
+    self.frame = [self screenBoundsSafely];
     self.windowLevel = UIWindowLevelAlert + 1000;
     self.backgroundColor = [UIColor clearColor];
     self.userInteractionEnabled = YES;
@@ -163,7 +180,7 @@
             self.windowScene = scene;
         }
     }
-    self.frame = [UIScreen mainScreen].bounds;
+    self.frame = [self screenBoundsSafely];
     self.hidden = NO;
     [self setNeedsLayout];
 }
@@ -171,8 +188,16 @@
 - (void)layoutSubviews {
     [super layoutSubviews];
 
-    self.frame = [UIScreen mainScreen].bounds;
-    self.rootViewController.view.frame = self.bounds;
+    // NOTE: do NOT assign self.frame here. Mutating a UIWindow's frame from
+    // inside -layoutSubviews re-enters the layout pass and, when the window's
+    // scene is not fully attached yet, walks into UIScreen/UIScene internals
+    // with an inconsistent state (observed as SIGBUS / Address size fault
+    // inside the window's own layout code on iOS 16). The window frame is
+    // established in -commonInit / -attachToBestSceneIfNeeded instead.
+    if (self.rootViewController.view.frame.size.width != self.bounds.size.width ||
+        self.rootViewController.view.frame.size.height != self.bounds.size.height) {
+        self.rootViewController.view.frame = self.bounds;
+    }
 
     if (CGRectEqualToRect(self.panelView.frame, CGRectZero)) {
         self.panelView.frame = [self defaultPanelFrame];
@@ -832,46 +857,49 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
 %end
 
 static void installHooks(void) {
-    struct rebinding corecryptoBindings[] = {
-        {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
-        {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
-        {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
-        {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final},
-    };
-    rebind_symbols(corecryptoBindings, sizeof(corecryptoBindings) / sizeof(corecryptoBindings[0]));
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        struct rebinding corecryptoBindings[] = {
+            {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
+            {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
+            {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
+            {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final},
+        };
+        rebind_symbols(corecryptoBindings, sizeof(corecryptoBindings) / sizeof(corecryptoBindings[0]));
 
-    struct rebinding commonCryptoBindings[] = {
-        {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
-        {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
-        {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
-        {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final},
-    };
-    rebind_symbols(commonCryptoBindings, sizeof(commonCryptoBindings) / sizeof(commonCryptoBindings[0]));
+        struct rebinding commonCryptoBindings[] = {
+            {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
+            {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
+            {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
+            {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final},
+        };
+        rebind_symbols(commonCryptoBindings, sizeof(commonCryptoBindings) / sizeof(commonCryptoBindings[0]));
 
-    MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
-    if (cryptoKitRef) {
-        void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
-        if (swiftHashSym) {
-            MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
-            gDidInstallCryptoKitWrapper = YES;
+        MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
+        if (cryptoKitRef) {
+            void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
+            if (swiftHashSym) {
+                MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
+                gDidInstallCryptoKitWrapper = YES;
+            }
         }
-    }
 
-    long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
-    NSString *startupMessage = [NSString stringWithFormat:
-                                @"[Generic SHA256 Hook]\n"
-                                @"Status: installed\n"
-                                @"Meaning: capture runtime SHA256 input without business-specific symbols\n"
-                                @"OneShot: CC_SHA256\n"
-                                @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
-                                @"CryptoKitWrapper: %@\n"
-                                @"UTF8Bridge: deferred correlate on SHA hit\n"
-                                @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
-                                gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
-    appendLogMessage(startupMessage,
-                     @"Runtime",
-                     @"installed",
-                     rawHits);
+        long long rawHits = __sync_add_and_fetch(&gRawHookHitCount, 0);
+        NSString *startupMessage = [NSString stringWithFormat:
+                                    @"[Generic SHA256 Hook]\n"
+                                    @"Status: installed\n"
+                                    @"Meaning: capture runtime SHA256 input without business-specific symbols\n"
+                                    @"OneShot: CC_SHA256\n"
+                                    @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
+                                    @"CryptoKitWrapper: %@\n"
+                                    @"UTF8Bridge: deferred correlate on SHA hit\n"
+                                    @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
+                                    gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
+        appendLogMessage(startupMessage,
+                         @"Runtime",
+                         @"installed",
+                         rawHits);
+    });
 }
 
 %ctor {
