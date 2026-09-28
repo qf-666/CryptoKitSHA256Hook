@@ -99,6 +99,29 @@
     return view;
 }
 
+// Retry attaching the overlay until a host window exists. Some apps build their
+// main window late (after didFinishLaunching), and the one-shot notifications
+// can fire before any UIWindow is on screen.
++ (void)startRetryLoop {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [self retryAttach];
+    });
+}
+
++ (void)retryAttach {
+    UIWindow *host = [self hostWindow];
+    if (host) {
+        [self shared];
+        return;
+    }
+    // No window yet; try again shortly.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self retryAttach];
+    });
+}
+
 - (CGRect)defaultPanelFrame {
     CGRect bounds = self.bounds;
     if (CGRectIsEmpty(bounds)) {
@@ -960,6 +983,12 @@ static void installHooks(void) {
                        dispatch_get_main_queue(), ^{
             [SHAOverlayView shared];
         });
+    });
+
+    // Some apps only create their main window well after didFinishLaunching.
+    // Keep retrying until one exists rather than giving up.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [SHAOverlayView startRetryLoop];
     });
 
     // rebind_symbols writes to __DATA_CONST (lazy/non-lazy pointer tables).
