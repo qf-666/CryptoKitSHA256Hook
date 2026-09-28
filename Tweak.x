@@ -51,23 +51,26 @@
                 continue;
             }
             UIWindowScene *windowScene = (UIWindowScene *)scene;
-            if (scene.activationState != UISceneActivationStateForegroundActive &&
-                scene.activationState != UISceneActivationStateForegroundInactive) {
-                continue;
-            }
             for (UIWindow *w in windowScene.windows) {
-                if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) {
+                if (w.windowLevel == UIWindowLevelNormal && !w.isHidden) {
                     return w;
                 }
             }
+        }
+        // No normal-level window yet; fall through to any window in any scene.
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
             for (UIWindow *w in windowScene.windows) {
-                if (w.windowLevel == UIWindowLevelNormal) {
+                if (!w.isHidden) {
                     return w;
                 }
             }
         }
     }
-    if (fallback && fallback.windowLevel == UIWindowLevelNormal) {
+    if (fallback && !fallback.isHidden) {
         return fallback;
     }
     return nil;
@@ -892,21 +895,51 @@ static void my_cryptokit_sha256(void *a, void *b, void *c) {
 static void installHooks(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        struct rebinding corecryptoBindings[] = {
-            {"ccdigest", (void *)my_ccdigest, (void **)&orig_ccdigest},
-            {"ccdigest_init", (void *)my_ccdigest_init, (void **)&orig_ccdigest_init},
-            {"ccdigest_update", (void *)my_ccdigest_update, (void **)&orig_ccdigest_update},
-            {"ccdigest_final", (void *)my_ccdigest_final, (void **)&orig_ccdigest_final},
-        };
-        rebind_symbols(corecryptoBindings, sizeof(corecryptoBindings) / sizeof(corecryptoBindings[0]));
+        // NOTE: we deliberately use MSHookFunction (which patches each
+        // function's own prologue) instead of fishhook rebind_symbols.
+        // rebind_symbols rewrites lazy/non-lazy pointer tables, which live in
+        // __DATA_CONST; on this app those pages are already locked down and
+        // mprotect-ing them corrupts the COW state, and the next stub dispatch
+        // faults with SIGBUS. MSHookFunction touches only the target function's
+        // own TEXT page, which is never COW-shared, so it is safe whenever it
+        // runs. It also catches direct/inlined callers, which fishhook cannot.
 
-        struct rebinding commonCryptoBindings[] = {
-            {"CC_SHA256", (void *)my_CC_SHA256, (void **)&orig_CC_SHA256},
-            {"CC_SHA256_Init", (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init},
-            {"CC_SHA256_Update", (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update},
-            {"CC_SHA256_Final", (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final},
-        };
-        rebind_symbols(commonCryptoBindings, sizeof(commonCryptoBindings) / sizeof(commonCryptoBindings[0]));
+        MSImageRef commonCrypto = MSGetImageByName("/usr/lib/libsystem_commonCrypto.dylib");
+        if (commonCrypto) {
+            void *sym = NULL;
+            if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256"))) {
+                MSHookFunction(sym, (void *)my_CC_SHA256, (void **)&orig_CC_SHA256);
+            }
+            if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Init"))) {
+                MSHookFunction(sym, (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init);
+            }
+            if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Update"))) {
+                MSHookFunction(sym, (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update);
+            }
+            if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Final"))) {
+                MSHookFunction(sym, (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final);
+            }
+        }
+
+        // CryptoKit's SHA256.hash(data:) compiles down to corecrypto's
+        // ccdigest family. These are plain C functions, so a plain C
+        // replacement is a safe drop-in.
+        MSImageRef corecrypto = MSGetImageByName("/usr/lib/libsystem_corecrypto.dylib");
+        if (corecrypto) {
+            void *sym = NULL;
+            if ((sym = MSFindSymbol(corecrypto, "_ccdigest"))) {
+                MSHookFunction(sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
+            }
+            if ((sym = MSFindSymbol(corecrypto, "_ccdigest_init"))) {
+                MSHookFunction(sym, (void *)my_ccdigest_init, (void **)&orig_ccdigest_init);
+            }
+            if ((sym = MSFindSymbol(corecrypto, "_ccdigest_update"))) {
+                MSHookFunction(sym, (void *)my_ccdigest_update, (void **)&orig_ccdigest_update);
+            }
+            if ((sym = MSFindSymbol(corecrypto, "_ccdigest_final"))) {
+                MSHookFunction(sym, (void *)my_ccdigest_final, (void **)&orig_ccdigest_final);
+            }
+        }
 
         MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
         if (cryptoKitRef) {
