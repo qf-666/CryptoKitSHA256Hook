@@ -116,6 +116,8 @@
     UIWindow *host = [self hostWindow];
     if (host) {
         [self shared];
+        appendLogMessage([NSString stringWithFormat:@"[Overlay] attached to host window: %@", host],
+                         @"Overlay", @"attached", __sync_add_and_fetch(&gRawHookHitCount, 0));
         return;
     }
     // No window yet; try again shortly.
@@ -904,49 +906,81 @@ static void installHooks(void) {
         // own TEXT page, which is never COW-shared, so it is safe whenever it
         // runs. It also catches direct/inlined callers, which fishhook cannot.
 
+        NSMutableArray *installReport = [NSMutableArray array];
+
         MSImageRef commonCrypto = MSGetImageByName("/usr/lib/libsystem_commonCrypto.dylib");
+        [installReport addObject:[NSString stringWithFormat:@"commonCrypto image: %@", commonCrypto ? @"found" : @"MISSING"]];
         if (commonCrypto) {
             void *sym = NULL;
             if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256"))) {
                 MSHookFunction(sym, (void *)my_CC_SHA256, (void **)&orig_CC_SHA256);
-            }
+                [installReport addObject:@"CC_SHA256 hooked"];
+            } else [installReport addObject:@"CC_SHA256 sym NOT FOUND"];
             if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Init"))) {
                 MSHookFunction(sym, (void *)my_CC_SHA256_Init, (void **)&orig_CC_SHA256_Init);
-            }
+                [installReport addObject:@"CC_SHA256_Init hooked"];
+            } else [installReport addObject:@"CC_SHA256_Init sym NOT FOUND"];
             if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Update"))) {
                 MSHookFunction(sym, (void *)my_CC_SHA256_Update, (void **)&orig_CC_SHA256_Update);
-            }
+                [installReport addObject:@"CC_SHA256_Update hooked"];
+            } else [installReport addObject:@"CC_SHA256_Update sym NOT FOUND"];
             if ((sym = MSFindSymbol(commonCrypto, "_CC_SHA256_Final"))) {
                 MSHookFunction(sym, (void *)my_CC_SHA256_Final, (void **)&orig_CC_SHA256_Final);
-            }
+                [installReport addObject:@"CC_SHA256_Final hooked"];
+            } else [installReport addObject:@"CC_SHA256_Final sym NOT FOUND"];
         }
 
         // CryptoKit's SHA256.hash(data:) compiles down to corecrypto's
         // ccdigest family. These are plain C functions, so a plain C
         // replacement is a safe drop-in.
         MSImageRef corecrypto = MSGetImageByName("/usr/lib/libsystem_corecrypto.dylib");
+        [installReport addObject:[NSString stringWithFormat:@"corecrypto image: %@", corecrypto ? @"found" : @"MISSING"]];
         if (corecrypto) {
             void *sym = NULL;
             if ((sym = MSFindSymbol(corecrypto, "_ccdigest"))) {
                 MSHookFunction(sym, (void *)my_ccdigest, (void **)&orig_ccdigest);
-            }
+                [installReport addObject:@"ccdigest hooked"];
+            } else [installReport addObject:@"ccdigest sym NOT FOUND"];
             if ((sym = MSFindSymbol(corecrypto, "_ccdigest_init"))) {
                 MSHookFunction(sym, (void *)my_ccdigest_init, (void **)&orig_ccdigest_init);
-            }
+                [installReport addObject:@"ccdigest_init hooked"];
+            } else [installReport addObject:@"ccdigest_init sym NOT FOUND"];
             if ((sym = MSFindSymbol(corecrypto, "_ccdigest_update"))) {
                 MSHookFunction(sym, (void *)my_ccdigest_update, (void **)&orig_ccdigest_update);
-            }
+                [installReport addObject:@"ccdigest_update hooked"];
+            } else [installReport addObject:@"ccdigest_update sym NOT FOUND"];
             if ((sym = MSFindSymbol(corecrypto, "_ccdigest_final"))) {
                 MSHookFunction(sym, (void *)my_ccdigest_final, (void **)&orig_ccdigest_final);
-            }
+                [installReport addObject:@"ccdigest_final hooked"];
+            } else [installReport addObject:@"ccdigest_final sym NOT FOUND"];
         }
 
         MSImageRef cryptoKitRef = MSGetImageByName("/System/Library/Frameworks/CryptoKit.framework/CryptoKit");
+        [installReport addObject:[NSString stringWithFormat:@"CryptoKit image: %@", cryptoKitRef ? @"found" : @"MISSING"]];
         if (cryptoKitRef) {
-            void *swiftHashSym = MSFindSymbol(cryptoKitRef, "_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ");
+            // Try the generic CryptoKit SHA256.hash(data:) symbol, plus the
+            // Foundation.Data-specialised variants the compiler usually emits.
+            NSArray *candidates = @[
+                @"_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestVcx_tc10Foundation12DataProtocolRzlFZ",
+                @"_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestV10Foundation4DataV_tFZ",
+                @"_$s9CryptoKit6SHA256V4hash4dataAA0C6DigestV_SStc10Foundation12DataProtocolRzlFZ",
+                @"_$s9CryptoKit6SHA256V4hash4dataSSAA0C6DigestV10Foundation4DataV_tFZ",
+            ];
+            void *swiftHashSym = NULL;
+            NSString *matchedName = nil;
+            for (NSString *name in candidates) {
+                swiftHashSym = MSFindSymbol(cryptoKitRef, [name UTF8String]);
+                if (swiftHashSym) {
+                    matchedName = name;
+                    break;
+                }
+            }
             if (swiftHashSym) {
                 MSHookFunction((void *)swiftHashSym, (void *)my_cryptokit_sha256, (void **)&orig_cryptokit_sha256);
                 gDidInstallCryptoKitWrapper = YES;
+                [installReport addObject:[NSString stringWithFormat:@"CryptoKit hooked: %@", matchedName]];
+            } else {
+                [installReport addObject:@"CryptoKit SHA256 hash symbol NOT FOUND (tried 4 candidates)"];
             }
         }
 
@@ -959,8 +993,10 @@ static void installHooks(void) {
                                     @"Incremental: CC_SHA256_Init/Update/Final + ccdigest_init/update/final\n"
                                     @"CryptoKitWrapper: %@\n"
                                     @"UTF8Bridge: deferred correlate on SHA hit\n"
-                                    @"DisplayRule: show all UTF-8 inputs, sample first binary inputs",
-                                    gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found"];
+                                    @"DisplayRule: show all UTF-8 inputs, sample first binary inputs\n"
+                                    @"\nInstallReport:\n%@",
+                                    gDidInstallCryptoKitWrapper ? @"hooked" : @"symbol-not-found",
+                                    [installReport componentsJoinedByString:@"\n"]];
         appendLogMessage(startupMessage,
                          @"Runtime",
                          @"installed",
