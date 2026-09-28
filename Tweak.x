@@ -36,8 +36,9 @@
 @implementation SHAOverlayView
 
 // Forward declarations: the overlay's retry loop logs before appendLogMessage
-// is defined further down.
+// and the hit counters are defined further down.
 static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
+extern long long gRawHookHitCount;
 
 // Find a window that actually exists and is on screen. Returns nil when the
 // host app has not finished building its UI yet; callers must tolerate that and
@@ -347,7 +348,8 @@ static void appendLogMessage(NSString *logMessage, NSString *source, NSString *n
 
 @end
 
-static long long gRawHookHitCount = 0;
+// Hit counters. Declared above so the overlay retry loop can log; defined here.
+long long gRawHookHitCount = 0;
 static long long gShownHookHitCount = 0;
 static long long gUTF8HitCount = 0;
 
