@@ -35,6 +35,10 @@
 
 @implementation SHAOverlayView
 
+// Forward declarations: the overlay's retry loop logs before appendLogMessage
+// is defined further down.
+static void appendLogMessage(NSString *logMessage, NSString *source, NSString *note, long long rawHits);
+
 // Find a window that actually exists and is on screen. Returns nil when the
 // host app has not finished building its UI yet; callers must tolerate that and
 // retry later.
