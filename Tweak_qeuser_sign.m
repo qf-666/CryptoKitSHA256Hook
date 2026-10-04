@@ -106,11 +106,18 @@ static void QEReport(NSString *tag, NSString *where, NSString *s) {
 
 // 变参方法不能直接把 orig IMP 当 C 函数转发 (会丢 va_list)。
 // 做法: 类方法用 initWithFormat:arguments: 等价重建; 带 va_list 的原方法则原样转发。
+//
+// ★ 必须用 [[self alloc] ...] 而不是 [[NSString alloc] ...]:
+//   +stringWithFormat: 是类方法, self 是**接收消息的类**, 不一定是 NSString.
+//   例如 [NSMutableString stringWithFormat:@"..."] → self = NSMutableString,
+//   原实现返回**可变**字符串; 若写死 NSString 就会降级成不可变 __NSCFString,
+//   调用方随后 appendFormat: 撞 mutateError → 未捕获异常 → abort
+//   (2026-10-04 三次崩溃 133051/181016/182534 的根因).
 
 static NSString *new_stringWithFormat(id self, SEL _cmd, NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     gQEInHook = 1;              // 走 hooked 的 initWithFormat:arguments: 时别重复记
-    NSString *r = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    NSString *r = [[self alloc] initWithFormat:fmt arguments:ap];
     gQEInHook = 0;
     va_end(ap);
     QEReport(@"QE-SIGN-PLAINTEXT", @"+[NSString stringWithFormat:]", r);
@@ -120,7 +127,7 @@ static NSString *new_stringWithFormat(id self, SEL _cmd, NSString *fmt, ...) {
 static NSString *new_localizedStringWithFormat(id self, SEL _cmd, NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     gQEInHook = 1;
-    NSString *r = [[NSString alloc] initWithFormat:fmt locale:[NSLocale currentLocale] arguments:ap];
+    NSString *r = [[self alloc] initWithFormat:fmt locale:[NSLocale currentLocale] arguments:ap];
     gQEInHook = 0;
     va_end(ap);
     QEReport(@"QE-SIGN-PLAINTEXT", @"+[NSString localizedStringWithFormat:]", r);
@@ -148,6 +155,10 @@ static id new_initWithFormat_locale_args(id self, SEL _cmd, NSString *fmt, id lo
 // 崩溃 104421 (mutateError) 就是改写返回值/可变性造成的。
 // 而且对 receiver 调两次 stringByAppendingString: 会产生额外对象,
 // 干扰 UIKit 的 description 路径 (见 133051)。
+//
+// ★ 这里必须用 [[self alloc] initWithFormat:arguments:] 而不是 [[NSString alloc] ...]:
+//   stringByAppendingFormat: 的 receiver 可能是 NSMutableString 的子类实例,
+//   重建 tail 时同样不能写死 NSString (否则 %@ 里嵌套的可变串又被降级).
 static IMP gOrigAppendingFormat = NULL;
 
 static NSString *new_appendingFormat(id self, SEL _cmd, NSString *fmt, ...) {
@@ -248,6 +259,8 @@ __attribute__((constructor)) static void QESignHookCtor(void) {
 #endif
 
         gQEInHook = 1;
+        // ★ 必须用 @"..." 字面量直传, 不能用 [NSString stringWithFormat:] 先拼
+        //   —— 那会重入我们刚装的 format hook
         NSLog(@"[QE_SIGN_HOOK] installed: stringWithFormat=ok initWithFormat:arguments:=%p "
               @"initWithFormat:locale:arguments:=%p CryptoKit.update=%@(%p) filter=%@",
               gOrigInitFmtArgs, gOrigInitFmtLocArgs,
