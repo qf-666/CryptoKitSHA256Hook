@@ -8,6 +8,7 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
+#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
