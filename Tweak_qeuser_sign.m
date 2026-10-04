@@ -21,8 +21,16 @@
 //   B. hook CryptoKit 流式 update 的 witness thunk, 用 vm_region 安全探测参数布局 → 交叉验证
 //   命中后本地再算一次 SHA256, 打印出来 == 请求头里的 sign, 一眼确认。
 //
+// ⚠️ 关于 B (CryptoKit.update) 的风险 (2026-10-04 发现):
+//   CryptoKit.HashFunction.update 是**系统框架**的热点符号, 被 App/SDK 大量调用。
+//   我们的 thunk 里做了 ObjC 操作 (QEReport → stringWithFormat/NSLog/description),
+//   会在这条系统路径内部插入对象构造 => 破坏 CFString 的 in-mutation 状态
+//   => 下游 description/appendFormat: 撞 mutateError => abort。
+//   Hook 由 QE_HOOK_CRYPTOKIT_UPDATE 开关控制, 默认关闭;
+//   只有当 A 路线 (stringWithFormat:) 抓不到明文时, 才打开它并接受该风险。
+//
 // 集成 (Makefile):
-//   CryptoKitSHA256Hook_FILES = Tweak.x Tweak_qeuser_sign.m fishhook.c
+//   CryptoKitSHA256Hook_FILES = Tweak_qeuser_sign.m fishhook.c
 // 日志与原版共用 Documents/CryptoHook.txt, 悬浮窗的 Copy 按钮一把复制。
 // ---------------------------------------------------------------------------
 
@@ -32,6 +40,14 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 #import <substrate.h>
+
+// CryptoKit.update 的 hook 会拦下**系统框架**的热点符号, 而我们的 thunk 里
+// 会做 ObjC 操作 (QEReport) → 在系统哈希路径里插入对象构造 →
+// 破坏 CFString 的 in-mutation 状态 → 下游 appendFormat: 撞 mutateError。
+// 默认关闭; 若 A 路线 (stringWithFormat:) 抓不到明文, 再置 1 打开并接受风险。
+#ifndef QE_HOOK_CRYPTOKIT_UPDATE
+#define QE_HOOK_CRYPTOKIT_UPDATE 0
+#endif
 
 // 只记录含这些标记的字符串, 避免被广告 SDK 的噪声淹没; 清空 = 全记
 static NSArray<NSString *> *QEMarks(void) { return @[@"appSecret=", @"_appid=", @"&timestamp="]; }
@@ -152,6 +168,7 @@ static NSString *new_appendingFormat(id self, SEL _cmd, NSString *fmt, ...) {
 #pragma mark - B. CryptoKit 流式 witness thunk
 
 // 用 vm_region 判断可读性, 猜错 ABI 也不会 SIGSEGV
+#if QE_HOOK_CRYPTOKIT_UPDATE
 static BOOL QESafeReadable(const void *ptr, size_t len) {
     if (!ptr || len == 0 || len > (1u << 22)) return NO;
     vm_address_t addr = (vm_address_t)ptr;
@@ -188,6 +205,7 @@ static void my_ck_update(void *a, void *b, void *c, void *d) {
     if (s) QEReport(@"QE-CRYPTOKIT-UPDATE", @"CryptoKit.HashFunction.update(bufferPointer:)", s);
     if (orig_ck_update) orig_ck_update(a, b, c, d);
 }
+#endif  // QE_HOOK_CRYPTOKIT_UPDATE
 
 #pragma mark - 安装
 
@@ -217,14 +235,17 @@ __attribute__((constructor)) static void QESignHookCtor(void) {
         // 而 stringWithFormat: 层已能覆盖签名明文
         QESwizzleInstanceMethod("NSString", @selector(stringByAppendingFormat:), (IMP)new_appendingFormat, &gOrigAppendingFormat);
 
-        // CryptoKit 流式 update 的 witness thunk —— App 真实导入的符号
+        // CryptoKit 流式 update 的 witness thunk —— 见文件头 ⚠️ 说明, 默认关闭
+        BOOL ckHooked = NO;
+        void *p = NULL;
+#if QE_HOOK_CRYPTOKIT_UPDATE
         const char *ckPath = "/System/Library/Frameworks/CryptoKit.framework/CryptoKit";
         void *ck = dlopen(ckPath, RTLD_LAZY);
         MSImageRef img = ck ? MSGetImageByName(ckPath) : NULL;
         const char *sym = "_$s9CryptoKit12HashFunctionP6update13bufferPointerySW_tFTj";
-        void *p = img ? MSFindSymbol(img, sym) : (ck ? dlsym(ck, sym) : NULL);
-        BOOL ckHooked = NO;
+        p = img ? MSFindSymbol(img, sym) : (ck ? dlsym(ck, sym) : NULL);
         if (p) { MSHookFunction(p, (void *)my_ck_update, (void **)&orig_ck_update); ckHooked = YES; }
+#endif
 
         gQEInHook = 1;
         NSLog(@"[QE_SIGN_HOOK] installed: stringWithFormat=ok initWithFormat:arguments:=%p "
