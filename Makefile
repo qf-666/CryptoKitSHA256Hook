@@ -13,7 +13,7 @@ TWEAK_NAME = CryptoKitSHA256Hook
 # 崩溃报告 (133051 os_state / 180742 GDT / 181016 FlowLayout NSLog) 都证明
 # 崩溃路径与我们的 ObjC hook 无关, 是 rebind 的副作用。
 # 签名明文已由 Tweak_qeuser_sign.m 的 stringWithFormat: 那层覆盖, 不需要它。
-CryptoKitSHA256Hook_FILES = Tweak_qeuser_sign.m fishhook.c
+CryptoKitSHA256Hook_FILES = Tweak_qeuser_sign.m QEOverlay.m fishhook.c
 CryptoKitSHA256Hook_CFLAGS = -fobjc-arc
 CryptoKitSHA256Hook_FRAMEWORKS = UIKit Foundation
 

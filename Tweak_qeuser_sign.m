@@ -40,6 +40,7 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 #import <substrate.h>
+#import "QEOverlay.h"
 
 // CryptoKit.update 的 hook 会拦下**系统框架**的热点符号, 而我们的 thunk 里
 // 会做 ObjC 操作 (QEReport) → 在系统哈希路径里插入对象构造 →
@@ -94,6 +95,9 @@ static void QELog(NSString *tag, NSString *where, NSString *plain) {
         if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         if (fh) { [fh seekToEndOfFile]; [fh writeData:[msg dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        // 屏幕可见: 标题 + 明文 + 本地 SHA256 摘要
+        QEOverlayAppend(tag, [NSString stringWithFormat:@"%@\n  len=%lu  sha256=%@",
+                              plain, (unsigned long)plain.length, QESha256Of(plain)]);
     } @catch (__unused NSException *e) {}
     gQEInHook = 0;
 }
@@ -266,5 +270,8 @@ __attribute__((constructor)) static void QESignHookCtor(void) {
               gOrigInitFmtArgs, gOrigInitFmtLocArgs,
               ckHooked ? @"hooked" : @"symbol-not-found", p, [QEMarks() componentsJoinedByString:@","]);
         gQEInHook = 0;
+
+        // 装好后立刻把悬浮窗挂上去 (确认它活着; 抓到签名时会自动追加)
+        QEOverlayAppend(@"QE_SIGN_HOOK", @"installed — 等待签名明文...");
     });
 }
