@@ -34,6 +34,16 @@ typedef struct nlist nlist_t;
 #define SEG_AUTH_CONST  "__AUTH_CONST"
 #endif
 
+// VM_PROT_COPY forces a private copy of a read-only COW file page, letting us
+// raise it to writable even when mprotect() is denied on iOS 16 rootless.
+#ifndef VM_PROT_COPY_SAFE
+#ifdef VM_PROT_COPY
+#define VM_PROT_COPY_SAFE VM_PROT_COPY
+#else
+#define VM_PROT_COPY_SAFE ((vm_prot_t) 0x10)
+#endif
+#endif
+
 struct rebindings_entry {
   struct rebinding *rebindings;
   size_t rebindings_nel;
@@ -112,12 +122,29 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
           }
           if (bindings[i] != cur->rebindings[j].replacement) {
             vm_prot_t prot = get_protection(bindings);
+            void *page = (void *)((uintptr_t)bindings & ~(PAGE_SIZE - 1));
+            bool writable = true;
             if (isDataConst) {
-              mprotect((void *)((uintptr_t)bindings & ~(PAGE_SIZE - 1)), PAGE_SIZE, prot | PROT_WRITE);
+              // iOS 16 rootless: dyld demotes __DATA_CONST to r-- (SM=COW from the
+              // file mapping) and mprotect() is denied with EPERM. Fall back to
+              // mach_vm_protect + VM_PROT_COPY, which forces a private copy of the
+              // COW page and can raise it to rw. If both fail, skip this binding
+              // instead of executing the store below and taking SIGBUS
+              // (KERN_PROTECTION_FAILURE) — see crash QEUser 1.142.0 / iOS 16.3.
+              writable = (mprotect(page, PAGE_SIZE, prot | PROT_WRITE) == 0);
+              if (!writable) {
+                kern_return_t kr = mach_vm_protect(
+                    mach_task_self(), (mach_vm_address_t)page, (mach_vm_size_t)PAGE_SIZE,
+                    false, prot | VM_PROT_WRITE | VM_PROT_COPY_SAFE);
+                writable = (kr == KERN_SUCCESS);
+              }
+              if (!writable) {
+                goto symbol_loop;
+              }
             }
             bindings[i] = cur->rebindings[j].replacement;
             if (isDataConst) {
-              mprotect((void *)((uintptr_t)bindings & ~(PAGE_SIZE - 1)), PAGE_SIZE, prot);
+              mprotect(page, PAGE_SIZE, prot);
             }
           }
           goto symbol_loop;
