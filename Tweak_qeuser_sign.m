@@ -128,19 +128,23 @@ static id new_initWithFormat_locale_args(id self, SEL _cmd, NSString *fmt, id lo
     return r;
 }
 
+// 只读观察, 绝不改写返回值:
+// 崩溃 104421 (mutateError) 就是改写返回值/可变性造成的。
+// 而且对 receiver 调两次 stringByAppendingString: 会产生额外对象,
+// 干扰 UIKit 的 description 路径 (见 133051)。
+static IMP gOrigAppendingFormat = NULL;
+
 static NSString *new_appendingFormat(id self, SEL _cmd, NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     gQEInHook = 1;
     NSString *tail = [[NSString alloc] initWithFormat:fmt arguments:ap];
     gQEInHook = 0;
     va_end(ap);
-    // 保住 receiver 的可变性: 对 NSMutableString 返回 mutableCopy,
-    // 否则下游对返回值 appendString: 会撞 mutateError (见崩溃 104421)
-    NSString *base = [self stringByAppendingString:@""];
-    NSString *r = [base stringByAppendingString:tail];
-    if ([self isKindOfClass:[NSMutableString class]]) {
-        r = [r mutableCopy];
-    }
+    // ★ 原样调用原实现 (它内部走 NSString 的 stringByAppendingString:),
+    //   拿到真正的返回值后再只看不碰
+    NSString *r = gOrigAppendingFormat
+        ? ((NSString *(*)(id, SEL, NSString *))gOrigAppendingFormat)(self, _cmd, tail)
+        : nil;
     QEReport(@"QE-SIGN-PLAINTEXT", @"-[NSString stringByAppendingFormat:]", r);
     return r;
 }
@@ -209,9 +213,9 @@ __attribute__((constructor)) static void QESignHookCtor(void) {
         if (m1) { gOrigInitFmtArgs = method_getImplementation(m1); method_setImplementation(m1, (IMP)new_initWithFormat_args); }
         Method m2 = class_getInstanceMethod([NSString class], @selector(initWithFormat:locale:arguments:));
         if (m2) { gOrigInitFmtLocArgs = method_getImplementation(m2); method_setImplementation(m2, (IMP)new_initWithFormat_locale_args); }
-        // 不 hook -[NSMutableString appendFormat:]: 它 in-place 修改 self,
-        // 而 stringWithFormat: 层已经能覆盖签名明文, 没必要冒 mutateError 的险
-        QESwizzleInstanceMethod("NSString", @selector(stringByAppendingFormat:), (IMP)new_appendingFormat, NULL);
+        // 不 hook -[NSMutableString appendFormat:]: in-place 修改 self, 风险高,
+        // 而 stringWithFormat: 层已能覆盖签名明文
+        QESwizzleInstanceMethod("NSString", @selector(stringByAppendingFormat:), (IMP)new_appendingFormat, &gOrigAppendingFormat);
 
         // CryptoKit 流式 update 的 witness thunk —— App 真实导入的符号
         const char *ckPath = "/System/Library/Frameworks/CryptoKit.framework/CryptoKit";
