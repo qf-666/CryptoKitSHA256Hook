@@ -4,8 +4,9 @@
 //   1. 绝不 hook 任何系统方法, 只用公开 API (addSubview 到宿主 window)
 //   2. 所有 UI 操作强制在主线程, 且用 dispatch_async 避免在系统路径里同步阻塞
 //   3. 文本只追加到 UITextView, 不调用任何可能重入 format hook 的路径
-//      (UITextView.text 赋值走的是自己的存储, 不经过 NSString format 家族)
 //   4. 面板可拖动, 有清空/复制按钮
+//   5. 面板尺寸**不依赖挂载时的 host.bounds** (早期可能为 0),
+//      改为在 layoutSubviews 里按当前 bounds 重新计算, 避免出现极窄/零高度
 // ---------------------------------------------------------------------------
 
 #import "QEOverlay.h"
@@ -13,15 +14,18 @@
 @interface QEOverlayPanel : UIView
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UILabel *titleLabel;
-@property (nonatomic, strong) UIView *panelBox;   // 面板盒子 (拖动目标)
+@property (nonatomic, strong) UIView *panelBox;
 @property (nonatomic, assign) CGPoint dragStart;
 @property (nonatomic, assign) CGPoint panelOrigin;
+@property (nonatomic, assign) BOOL boxPositioned;
+- (void)renderText;   // 供 QEOverlayAppend 调用
 @end
 
 static QEOverlayPanel *gPanel = nil;
-static UIView *gHost = nil;
+static NSMutableString *gText = nil;   // 单一数据源, 避免反复读 tv.text
+static dispatch_once_t gTextOnce;
 
-#pragma mark - 找宿主 window (与 Tweak.x 同策略, 只看 UIWindowScene)
+#pragma mark - 宿主 window
 
 static UIWindow *QEHostWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -63,56 +67,105 @@ static UIWindow *QEHostWindow(void) {
 - (void)buildSubviews {
     UIColor *green = [UIColor systemGreenColor];
 
-    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(10, 80, MIN(340, self.bounds.size.width - 20), 260)];
-    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(10, 80, 340, 300)];
+    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.88];
     box.layer.cornerRadius = 12.0;
     box.layer.borderWidth = 1.0;
     box.layer.borderColor = [green colorWithAlphaComponent:0.5].CGColor;
     box.clipsToBounds = YES;
-    box.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    box.autoresizingMask = UIViewAutoresizingNone;
     [self addSubview:box];
-    self.panelOrigin = box.frame.origin;
+    self.panelBox = box;
 
-    // 标题栏 (兼拖动把手)
-    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, box.bounds.size.width, 28)];
-    bar.backgroundColor = [green colorWithAlphaComponent:0.22];
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, box.bounds.size.width, 30)];
+    bar.backgroundColor = [green colorWithAlphaComponent:0.25];
+    bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [box addSubview:bar];
 
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, box.bounds.size.width - 100, 28)];
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, box.bounds.size.width - 130, 30)];
     lbl.text = @"QE_SIGN_HOOK";
-    lbl.font = [UIFont boldSystemFontOfSize:12];
+    lbl.font = [UIFont boldSystemFontOfSize:13];
     lbl.textColor = green;
+    lbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [bar addSubview:lbl];
     self.titleLabel = lbl;
 
     UIButton *clear = [UIButton buttonWithType:UIButtonTypeSystem];
-    clear.frame = CGRectMake(box.bounds.size.width - 90, 2, 40, 24);
+    clear.frame = CGRectMake(box.bounds.size.width - 104, 3, 46, 24);
     [clear setTitle:@"清空" forState:UIControlStateNormal];
-    clear.titleLabel.font = [UIFont systemFontOfSize:12];
+    clear.titleLabel.font = [UIFont systemFontOfSize:13];
+    clear.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [clear addTarget:self action:@selector(onClear) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:clear];
 
     UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
-    copy.frame = CGRectMake(box.bounds.size.width - 46, 2, 40, 24);
+    copy.frame = CGRectMake(box.bounds.size.width - 54, 3, 46, 24);
     [copy setTitle:@"复制" forState:UIControlStateNormal];
-    copy.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    copy.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    copy.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [copy addTarget:self action:@selector(onCopy) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:copy];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
     [bar addGestureRecognizer:pan];
 
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(6, 32, box.bounds.size.width - 12, box.bounds.size.height - 38)];
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(6, 34, box.bounds.size.width - 12, box.bounds.size.height - 40)];
     tv.backgroundColor = [UIColor clearColor];
     tv.textColor = [UIColor whiteColor];
-    tv.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     tv.editable = NO;
     tv.scrollEnabled = YES;
-    tv.text = @"等待签名...\n";
+    tv.alwaysBounceVertical = YES;
+    tv.textContainerInset = UIEdgeInsetsMake(2, 2, 2, 2);
+    tv.textContainer.lineFragmentPadding = 0;
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [box addSubview:tv];
     self.textView = tv;
 
-    self.panelBox = box;
+    // 文本用 attribute 赋, 保证不经过任何 format 家族
+    dispatch_once(&gTextOnce, ^{ gText = [NSMutableString string]; });
+    [self renderText];
+}
+
+// 按当前 bounds 重新摆面板 (挂载时 host.bounds 可能还是 0)
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    UIView *box = self.panelBox;
+    if (!box) return;
+
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    if (w < 40 || h < 80) return;   // host 还没量好, 下次再说
+
+    CGSize want = CGSizeMake(MIN(340.0, w - 20.0), MIN(320.0, h - 160.0));
+    if (want.width < 180) want.width = 180;
+    if (want.height < 150) want.height = 150;
+
+    CGRect f = box.frame;
+    f.size = want;
+    if (!self.boxPositioned) {
+        f.origin = CGPointMake(10, 90);
+        self.boxPositioned = YES;
+        self.panelOrigin = f.origin;
+    }
+    // 夹回屏内
+    if (f.origin.x + f.size.width > w) f.origin.x = MAX(0, w - f.size.width);
+    if (f.origin.y + f.size.height > h) f.origin.y = MAX(20, h - f.size.height);
+    box.frame = f;
+}
+
+- (void)renderText {
+    UITextView *tv = self.textView;
+    if (!tv) return;
+    // ★ 用 NSString 副本赋值; 不要用 stringByAppendingString: 拼可变串
+    NSString *snapshot = [NSString stringWithString:(gText ?: @"")];
+    tv.text = snapshot;
+
+    // 滚到底
+    if (tv.text.length > 0) {
+        NSRange r = NSMakeRange(tv.text.length - 1, 1);
+        [tv scrollRangeToVisible:r];
+    }
 }
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
@@ -123,21 +176,25 @@ static UIWindow *QEHostWindow(void) {
         self.dragStart = t;
         self.panelOrigin = box.frame.origin;
     } else if (g.state == UIGestureRecognizerStateChanged) {
-        CGPoint p = CGPointMake(self.panelOrigin.x + (t.x - self.dragStart.x),
-                                self.panelOrigin.y + (t.y - self.dragStart.y));
-        p.x = MAX(0, MIN(self.bounds.size.width - box.bounds.size.width, p.x));
-        p.y = MAX(20, MIN(self.bounds.size.height - 60, p.y));
-        box.frame = CGRectMake(p.x, p.y, box.bounds.size.width, box.bounds.size.height);
+        CGFloat nx = self.panelOrigin.x + (t.x - self.dragStart.x);
+        CGFloat ny = self.panelOrigin.y + (t.y - self.dragStart.y);
+        nx = MAX(0, MIN(self.bounds.size.width - box.bounds.size.width, nx));
+        ny = MAX(20, MIN(self.bounds.size.height - 60, ny));
+        box.frame = CGRectMake(nx, ny, box.bounds.size.width, box.bounds.size.height);
     }
 }
 
 - (void)onClear {
-    self.textView.text = @"";
+    dispatch_once(&gTextOnce, ^{ gText = [NSMutableString string]; });
+    [gText setString:@""];
+    [self renderText];
 }
 
 - (void)onCopy {
+    dispatch_once(&gTextOnce, ^{ gText = [NSMutableString string]; });
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    pb.string = self.textView.text ?: @"";
+    // 用 NSString 副本, 避免可变串泄漏到剪贴板
+    pb.string = [NSString stringWithString:gText];
     NSString *old = self.titleLabel.text;
     self.titleLabel.text = @"已复制 ✓";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
@@ -156,7 +213,7 @@ void QEOverlayEnsure(void) {
         return;
     }
     UIWindow *host = QEHostWindow();
-    if (!host) return;   // UI 还没建好, 下次再来
+    if (!host) return;
 
     if (!gPanel) {
         gPanel = [[QEOverlayPanel alloc] initWithFrame:host.bounds];
@@ -167,31 +224,31 @@ void QEOverlayEnsure(void) {
         [host addSubview:gPanel];
     } else if (!CGRectEqualToRect(gPanel.frame, host.bounds)) {
         gPanel.frame = host.bounds;
+    } else {
+        [gPanel setNeedsLayout];
     }
-    gHost = host;
 }
 
 void QEOverlayAppend(NSString *title, NSString *body) {
     if (!title || !body) return;
-    // ★ 必须异步: 我们可能在系统哈希/description 路径里被调用,
-    //   同步做 UI 会在这条路径上引入额外对象创建与锁, 重蹈 mutateError
     dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_once(&gTextOnce, ^{ gText = [NSMutableString string]; });
         QEOverlayEnsure();
-        if (!gPanel) return;
-        // 手动拼接, 不用 stringWithFormat (避免重入 format hook)
-        NSMutableString *s = [NSMutableString stringWithCapacity:body.length + 64];
-        [s appendString:@"["];
-        [s appendString:title];
-        [s appendString:@"]  "];
-        [s appendString:body];
-        [s appendString:@"\n\n"];
 
-        UITextView *tv = gPanel.textView;
-        NSString *old = tv.text ?: @"";
-        if (old.length > 40000) old = @"";   // 防无限增长
-        tv.text = [old stringByAppendingString:s];
-        // 滚到底
-        NSRange r = NSMakeRange(tv.text.length, 0);
-        [tv scrollRangeToVisible:r];
+        // 纯 appendString, 不经过 format 家族
+        [gText appendString:@"【"];
+        [gText appendString:title];
+        [gText appendString:@"】\n"];
+        [gText appendString:body];
+        [gText appendString:@"\n\n"];
+
+        // 防无限增长: 超过 200KB 截掉前一半
+        if (gText.length > 200000) {
+            NSRange cut = NSMakeRange(0, 100000);
+            [gText deleteCharactersInRange:cut];
+            [gText insertString:@"...(前面已截断)...\n" atIndex:0];
+        }
+
+        if (gPanel) [gPanel renderText];
     });
 }
