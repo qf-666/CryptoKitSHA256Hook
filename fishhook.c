@@ -8,7 +8,6 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
-#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -44,6 +43,13 @@ typedef struct nlist nlist_t;
 #define VM_PROT_COPY_SAFE ((vm_prot_t) 0x10)
 #endif
 #endif
+
+// mach_vm_protect is not declared in the iPhoneOS SDK headers (mach_vm.h is
+// "#error unsupported" there), but it is exported by libSystem; declare it
+// manually. On arm64 it has the same effect as vm_protect.
+kern_return_t mach_vm_protect(mach_port_name_t task, mach_vm_address_t address,
+                              mach_vm_size_t size, boolean_t set_maximum,
+                              vm_prot_t new_protection);
 
 struct rebindings_entry {
   struct rebinding *rebindings;
