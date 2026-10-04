@@ -128,8 +128,13 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
             *(cur->rebindings[j].replaced) = bindings[i];
           }
           if (bindings[i] != cur->rebindings[j].replacement) {
-            vm_prot_t prot = get_protection(bindings);
-            void *page = (void *)((uintptr_t)bindings & ~(PAGE_SIZE - 1));
+            vm_prot_t prot = get_protection(&bindings[i]);
+            // The page being modified must be derived from the actual slot address
+            // &bindings[i], NOT the section base — the pointer table spans many
+            // pages and only the slot's own page needs (and gets) re-protection.
+            void *page = (void *)((uintptr_t)&bindings[i] & ~(PAGE_SIZE - 1));
+            uintptr_t endPage = ((uintptr_t)&bindings[i] + sizeof(void *) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            size_t span = (size_t)(endPage - (uintptr_t)page);
             bool writable = true;
             if (isDataConst) {
               // iOS 16 rootless: dyld demotes __DATA_CONST to r-- (SM=COW from the
@@ -138,10 +143,10 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
               // COW page and can raise it to rw. If both fail, skip this binding
               // instead of executing the store below and taking SIGBUS
               // (KERN_PROTECTION_FAILURE) — see crash QEUser 1.142.0 / iOS 16.3.
-              writable = (mprotect(page, PAGE_SIZE, prot | PROT_WRITE) == 0);
+              writable = (mprotect(page, span, prot | PROT_WRITE) == 0);
               if (!writable) {
                 kern_return_t kr = mach_vm_protect(
-                    mach_task_self(), (mach_vm_address_t)page, (mach_vm_size_t)PAGE_SIZE,
+                    mach_task_self(), (mach_vm_address_t)page, (mach_vm_size_t)span,
                     false, prot | VM_PROT_WRITE | VM_PROT_COPY_SAFE);
                 writable = (kr == KERN_SUCCESS);
               }
@@ -151,7 +156,7 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
             }
             bindings[i] = cur->rebindings[j].replacement;
             if (isDataConst) {
-              mprotect(page, PAGE_SIZE, prot);
+              mprotect(page, span, prot);
             }
           }
           goto symbol_loop;
